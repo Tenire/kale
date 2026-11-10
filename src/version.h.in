@@ -1,0 +1,17 @@
+#pragma once
+
+#include <string_view>
+
+#define KALE_VERSION       "${VERSION}"
+#define KALE_VERSION_MAJOR ${VERSION_MAJOR}
+#define KALE_VERSION_MINOR ${VERSION_MINOR}
+#define KALE_VERSION_PATCH ${VERSION_ALTER}
+#define KALE_VERSION_BUILD "${VERSION_BUILD}"
+
+namespace kale {
+
+constexpr std::string_view version() noexcept {
+    return KALE_VERSION;
+}
+
+} // namespace kale

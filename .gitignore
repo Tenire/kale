@@ -1,0 +1,7 @@
+.xmake/
+build/
+.vscode/
+.idea/
+.codegraph/
+.cache/
+

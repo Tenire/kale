@@ -1,0 +1,8 @@
+Hello from Kale C++20 Framework!
+This is a sample text asset served by Kale's asynchronous file service.
+Features demonstrated:
+- Asynchronous non-blocking file reads via coke::pread
+- Full RFC 7233 range requests (single and multipart byteranges)
+- Automatic MIME type inference (text/plain)
+- LRU caching with mtime invalidation
+End of sample text asset.
