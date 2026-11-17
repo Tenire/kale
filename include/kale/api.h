@@ -5,9 +5,10 @@
  */
 #ifndef KALE_API_H
 #define KALE_API_H
-#include <kale/http/binding.h>
+
 #include <kale/http/field_desc.h>
 #include <kale/http/json_reader.h>
+#include <kale/http/json_writer.h>
 #include <kale/http/openapi.h>
 #include <kale/http/validator.h>
 

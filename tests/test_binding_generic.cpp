@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <limits>
 #include <map>
-#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -16,16 +15,12 @@
 
 #include "kale/http/field_desc.h"
 #include "kale/http/json_reader.h"
-#include "kale/http/binding.h"
+#include "kale/http/json_writer.h"
 #include "kale/core/context.h"
 #include "kale/core/http_server.h"
-#include "kale/core/router.h"
-#include "kale/core/http_status.h"
-#include "kale/core/http_method.h"
 #include "kale/core/http_util.h"
 
 #include "coke/http/http_client.h"
-#include "coke/sleep.h"
 #include "coke/task.h"
 #include "coke/wait.h"
 #include "workflow/HttpUtil.h"
@@ -300,7 +295,7 @@ TEST_CASE("Generic DTO: Valid comprehensive payload binding and string ownership
         GenericMasterDTO dto;
         {
             // Execute parse and bind inside temporary scope to test string ownership
-            dto = kale::bind_json_body<GenericMasterDTO, J>(valid_json);
+            dto = kale::bind_json<GenericMasterDTO, J>(valid_json);
         }
 
         // Validate primitive and numeric fields
@@ -351,6 +346,132 @@ TEST_CASE("Generic DTO: Valid comprehensive payload binding and string ownership
     }
 }
 
+TEST_CASE("Generic DTO Writer: Scalar, nested, and vector serialization") {
+    struct StringViewDTO {
+        std::string_view label;
+        bool flag{false};
+
+        KALE_BIND(
+            KALE_FIELD(label),
+            KALE_FIELD(flag)
+        )
+    };
+
+    auto run_test = []<typename J>() {
+        GenericMasterDTO dto;
+        dto.name = "Alice";
+        dto.age = -7;
+        dto.count = 42u;
+        dto.large_id = 9007199254740991LL;
+        dto.large_counter = 9007199254740991ULL;
+        dto.score = 99.5;
+        dto.active = true;
+        dto.note = "lead";
+        dto.extra_code = 200;
+        dto.item = GenericItemDTO{"Token", 77};
+        dto.tags = {"core", "net"};
+        dto.numbers = {1, 2, 3};
+        dto.items = {GenericItemDTO{"A", 10}, GenericItemDTO{"B", 20}};
+
+        J obj = kale::to_json<GenericMasterDTO, J>(dto);
+        std::string dumped = kale::dump_json<GenericMasterDTO, J>(dto);
+        J parsed = J::parse(dumped);
+
+        CHECK(obj.is_object());
+        CHECK(parsed.is_object());
+        CHECK_EQ(parsed["name"].template get<std::string>(), "Alice");
+        CHECK_EQ(parsed["age"].template get<int>(), -7);
+        CHECK_EQ(parsed["count"].template get<uint32_t>(), 42u);
+        CHECK_EQ(parsed["large_id"].template get<int64_t>(), 9007199254740991LL);
+        CHECK_EQ(parsed["large_counter"].template get<uint64_t>(), 9007199254740991ULL);
+        CHECK_EQ(parsed["score"].template get<double>(), doctest::Approx(99.5));
+        CHECK(parsed["active"].template get<bool>());
+        CHECK_EQ(parsed["note"].template get<std::string>(), "lead");
+        CHECK_EQ(parsed["extra_code"].template get<int>(), 200);
+        CHECK_EQ(parsed["item"]["title"].template get<std::string>(), "Token");
+        CHECK_EQ(parsed["item"]["code"].template get<int>(), 77);
+        REQUIRE_EQ(parsed["tags"].size(), 2);
+        CHECK_EQ(parsed["tags"][0].template get<std::string>(), "core");
+        CHECK_EQ(parsed["tags"][1].template get<std::string>(), "net");
+        REQUIRE_EQ(parsed["numbers"].size(), 3);
+        CHECK_EQ(parsed["numbers"][0].template get<int>(), 1);
+        CHECK_EQ(parsed["numbers"][2].template get<int>(), 3);
+        REQUIRE_EQ(parsed["items"].size(), 2);
+        CHECK_EQ(parsed["items"][0]["title"].template get<std::string>(), "A");
+        CHECK_EQ(parsed["items"][1]["code"].template get<int>(), 20);
+
+        StringViewDTO sv_dto{"view_ok", true};
+        J sv_json = kale::to_json<StringViewDTO, J>(sv_dto);
+        CHECK_EQ(sv_json["label"].template get<std::string>(), "view_ok");
+        CHECK(sv_json["flag"].template get<bool>());
+    };
+
+    SUBCASE("kale::Json") {
+        run_test.template operator()<kale::Json>();
+    }
+    SUBCASE("nlohmann::json") {
+        run_test.template operator()<nlohmann::json>();
+    }
+    SUBCASE("nlohmann::ordered_json") {
+        run_test.template operator()<nlohmann::ordered_json>();
+    }
+}
+
+TEST_CASE("Generic DTO Writer: bind_json <-> to_json round-trip") {
+    auto run_test = []<typename J>() {
+        GenericMasterDTO src;
+        src.name = "RoundTrip";
+        src.age = 41;
+        src.count = 7;
+        src.large_id = 9007199254740991LL;
+        src.large_counter = 9007199254740991ULL;
+        src.score = 88.25;
+        src.active = true;
+        src.note = "persisted";
+        src.extra_code = std::nullopt;
+        src.item = GenericItemDTO{"Nested", 55};
+        src.tags = {"x", "y"};
+        src.numbers = {4, 5, 6};
+        src.items = {GenericItemDTO{"I1", 11}, GenericItemDTO{"I2", 22}};
+
+        const std::string compact = kale::dump_json<GenericMasterDTO, J>(src);
+        CHECK_EQ(compact.find('\n'), std::string::npos);
+
+        const std::string pretty = kale::dump_json<GenericMasterDTO, J>(
+            src, 2, kale::JsonWriteOptions{.optional_null = kale::OptionalNullPolicy::EmitNull});
+        CHECK_NE(pretty.find('\n'), std::string::npos);
+
+        const auto rt_compact = kale::bind_json<GenericMasterDTO, J>(compact);
+        const auto rt_pretty = kale::bind_json<GenericMasterDTO, J>(pretty);
+
+        for (const auto &rt : {rt_compact, rt_pretty}) {
+            CHECK_EQ(rt.name, src.name);
+            CHECK_EQ(rt.age, src.age);
+            CHECK_EQ(rt.count, src.count);
+            CHECK_EQ(rt.large_id, src.large_id);
+            CHECK_EQ(rt.large_counter, src.large_counter);
+            CHECK_EQ(rt.score, doctest::Approx(src.score));
+            CHECK_EQ(rt.active, src.active);
+            CHECK_EQ(rt.note, src.note);
+            CHECK_FALSE(rt.extra_code.has_value());
+            CHECK_EQ(rt.item.title, src.item.title);
+            CHECK_EQ(rt.item.code, src.item.code);
+            CHECK_EQ(rt.tags, src.tags);
+            CHECK_EQ(rt.numbers, src.numbers);
+            REQUIRE_EQ(rt.items.size(), src.items.size());
+            CHECK_EQ(rt.items[0].title, src.items[0].title);
+            CHECK_EQ(rt.items[1].code, src.items[1].code);
+        }
+    };
+
+    SUBCASE("kale::Json") {
+        run_test.template operator()<kale::Json>();
+    }
+    SUBCASE("nlohmann::json") {
+        run_test.template operator()<nlohmann::json>();
+    }
+}
+
 TEST_CASE("Generic DTO: Optional fields handling (present, missing, null)") {
     auto run_test = []<typename J>() {
         // Case 1: Optional fields missing from JSON -> std::nullopt
@@ -368,7 +489,7 @@ TEST_CASE("Generic DTO: Optional fields handling (present, missing, null)") {
             "items": []
         })";
 
-        auto dto_missing = kale::bind_json_body<GenericMasterDTO, J>(missing_opt);
+        auto dto_missing = kale::bind_json<GenericMasterDTO, J>(missing_opt);
         CHECK_FALSE(dto_missing.note.has_value());
         CHECK_FALSE(dto_missing.extra_code.has_value());
 
@@ -389,9 +510,46 @@ TEST_CASE("Generic DTO: Optional fields handling (present, missing, null)") {
             "items": []
         })";
 
-        auto dto_null = kale::bind_json_body<GenericMasterDTO, J>(null_opt);
+        auto dto_null = kale::bind_json<GenericMasterDTO, J>(null_opt);
         CHECK_FALSE(dto_null.note.has_value());
         CHECK_FALSE(dto_null.extra_code.has_value());
+    };
+
+    SUBCASE("kale::Json") {
+        run_test.template operator()<kale::Json>();
+    }
+    SUBCASE("nlohmann::json") {
+        run_test.template operator()<nlohmann::json>();
+    }
+}
+
+TEST_CASE("Generic DTO Writer: OptionalNullPolicy::Omit vs EmitNull") {
+    auto has_key = []<typename J>(const J &obj, std::string_view key) -> bool {
+        if constexpr (requires { obj.has(key); }) {
+            return obj.has(key);
+        } else {
+            return obj.contains(std::string(key));
+        }
+    };
+
+    auto run_test = [&]<typename J>() {
+        GenericMasterDTO dto;
+        dto.name = "Bob";
+        dto.age = 25;
+        dto.note = std::nullopt;
+        dto.extra_code = 99;
+
+        J omitted = kale::to_json<GenericMasterDTO, J>(dto);
+        CHECK_FALSE(has_key(omitted, "note"));
+        CHECK(has_key(omitted, "extra_code"));
+        CHECK_EQ(omitted["extra_code"].template get<int>(), 99);
+
+        J emitted = kale::to_json<GenericMasterDTO, J>(
+            dto, kale::JsonWriteOptions{.optional_null = kale::OptionalNullPolicy::EmitNull});
+        CHECK(has_key(emitted, "note"));
+        CHECK(emitted["note"].is_null());
+        CHECK(has_key(emitted, "extra_code"));
+        CHECK_EQ(emitted["extra_code"].template get<int>(), 99);
     };
 
     SUBCASE("kale::Json") {
@@ -419,7 +577,7 @@ TEST_CASE("Generic DTO: Missing required fields throw JsonBindError with exact p
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(missing_root);
+            (void)kale::bind_json<GenericMasterDTO, J>(missing_root);
             FAIL("Expected JsonBindError for missing root required field");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "name");
@@ -444,7 +602,7 @@ TEST_CASE("Generic DTO: Missing required fields throw JsonBindError with exact p
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(missing_nested);
+            (void)kale::bind_json<GenericMasterDTO, J>(missing_nested);
             FAIL("Expected JsonBindError for missing nested required field");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "item.code");
@@ -472,7 +630,7 @@ TEST_CASE("Generic DTO: Missing required fields throw JsonBindError with exact p
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(missing_array_elem);
+            (void)kale::bind_json<GenericMasterDTO, J>(missing_array_elem);
             FAIL("Expected JsonBindError for missing field inside array element");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "items[1].code");
@@ -508,7 +666,7 @@ TEST_CASE("Generic DTO: Null required fields throw JsonBindError with exact path
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(null_root);
+            (void)kale::bind_json<GenericMasterDTO, J>(null_root);
             FAIL("Expected JsonBindError for null root required field");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "name");
@@ -533,7 +691,7 @@ TEST_CASE("Generic DTO: Null required fields throw JsonBindError with exact path
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(null_nested);
+            (void)kale::bind_json<GenericMasterDTO, J>(null_nested);
             FAIL("Expected JsonBindError for null nested required field");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "item.title");
@@ -569,7 +727,7 @@ TEST_CASE("Generic DTO: Type mismatch errors throw JsonBindError with expected t
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(type_mismatch_string);
+            (void)kale::bind_json<GenericMasterDTO, J>(type_mismatch_string);
             FAIL("Expected JsonBindError for string type mismatch");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "name");
@@ -593,7 +751,7 @@ TEST_CASE("Generic DTO: Type mismatch errors throw JsonBindError with expected t
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(type_mismatch_bool);
+            (void)kale::bind_json<GenericMasterDTO, J>(type_mismatch_bool);
             FAIL("Expected JsonBindError for boolean type mismatch");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "active");
@@ -617,7 +775,7 @@ TEST_CASE("Generic DTO: Type mismatch errors throw JsonBindError with expected t
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(type_mismatch_object);
+            (void)kale::bind_json<GenericMasterDTO, J>(type_mismatch_object);
             FAIL("Expected JsonBindError for object type mismatch");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "item");
@@ -641,7 +799,7 @@ TEST_CASE("Generic DTO: Type mismatch errors throw JsonBindError with expected t
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(type_mismatch_array);
+            (void)kale::bind_json<GenericMasterDTO, J>(type_mismatch_array);
             FAIL("Expected JsonBindError for array type mismatch");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "tags");
@@ -665,7 +823,7 @@ TEST_CASE("Generic DTO: Type mismatch errors throw JsonBindError with expected t
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(array_elem_mismatch);
+            (void)kale::bind_json<GenericMasterDTO, J>(array_elem_mismatch);
             FAIL("Expected JsonBindError for array element type mismatch");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "tags[1]");
@@ -696,7 +854,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
             "u64": 9007199254740991
         })";
 
-        auto dto = kale::bind_json_body<IntegerTargetsDTO, J>(valid_ints);
+        auto dto = kale::bind_json<IntegerTargetsDTO, J>(valid_ints);
         CHECK_EQ(dto.i8, 127);
         CHECK_EQ(dto.u8, 255);
         CHECK_EQ(dto.i16, 32767);
@@ -709,7 +867,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // int8_t positive overflow: 128
         std::string i8_overflow = R"({"i8": 128, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 0, "i64": 0, "u64": 0})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(i8_overflow);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(i8_overflow);
             FAIL("Expected overflow error for i8");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "i8");
@@ -720,7 +878,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // int8_t negative underflow: -129
         std::string i8_underflow = R"({"i8": -129, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 0, "i64": 0, "u64": 0})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(i8_underflow);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(i8_underflow);
             FAIL("Expected underflow error for i8");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "i8");
@@ -731,7 +889,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // uint8_t overflow: 256
         std::string u8_overflow = R"({"i8": 0, "u8": 256, "i16": 0, "u16": 0, "i32": 0, "u32": 0, "i64": 0, "u64": 0})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(u8_overflow);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(u8_overflow);
             FAIL("Expected overflow error for u8");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "u8");
@@ -742,7 +900,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // uint8_t negative value rejection
         std::string u8_negative = R"({"i8": 0, "u8": -1, "i16": 0, "u16": 0, "i32": 0, "u32": 0, "i64": 0, "u64": 0})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(u8_negative);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(u8_negative);
             FAIL("Expected negative unsigned error for u8");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "u8");
@@ -753,7 +911,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // uint32_t negative value rejection
         std::string u32_negative = R"({"i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": -50, "i64": 0, "u64": 0})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(u32_negative);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(u32_negative);
             FAIL("Expected negative unsigned error for u32");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "u32");
@@ -764,7 +922,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // uint64_t negative value rejection
         std::string u64_negative = R"({"i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 0, "i64": 0, "u64": -1})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(u64_negative);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(u64_negative);
             FAIL("Expected negative unsigned error for u64");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "u64");
@@ -775,7 +933,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // Fractional value for integer rejection
         std::string frac_for_int = R"({"i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 42.5, "u32": 0, "i64": 0, "u64": 0})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(frac_for_int);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(frac_for_int);
             FAIL("Expected non-integer rejection for i32");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "i32");
@@ -786,7 +944,7 @@ TEST_CASE("Generic DTO: Kind-aware numeric boundaries and target overflow") {
         // Fractional value for unsigned integer rejection
         std::string frac_for_uint = R"({"i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 10.25, "i64": 0, "u64": 0})";
         try {
-            (void)kale::bind_json_body<IntegerTargetsDTO, J>(frac_for_uint);
+            (void)kale::bind_json<IntegerTargetsDTO, J>(frac_for_uint);
             FAIL("Expected non-integer rejection for u32");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "u32");
@@ -810,7 +968,7 @@ TEST_CASE("Generic DTO: Floating point target boundaries and nonfinite handling"
             "f64": 2.718281828459045
         })";
 
-        auto dto = kale::bind_json_body<FloatTargetsDTO, J>(valid_floats);
+        auto dto = kale::bind_json<FloatTargetsDTO, J>(valid_floats);
         CHECK_EQ(dto.f32, doctest::Approx(3.14159f));
         CHECK_EQ(dto.f64, doctest::Approx(2.718281828459045));
 
@@ -821,7 +979,7 @@ TEST_CASE("Generic DTO: Floating point target boundaries and nonfinite handling"
         })";
 
         try {
-            (void)kale::bind_json_body<FloatTargetsDTO, J>(f32_overflow);
+            (void)kale::bind_json<FloatTargetsDTO, J>(f32_overflow);
             FAIL("Expected float overflow error for f32");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "f32");
@@ -848,7 +1006,7 @@ TEST_CASE("Native nlohmann: Full 64-bit integer precision beyond double 2^53 man
         "i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 0
     })";
 
-    auto dto = kale::bind_json_body<IntegerTargetsDTO, nlohmann::json>(exact64_json);
+    auto dto = kale::bind_json<IntegerTargetsDTO, nlohmann::json>(exact64_json);
     CHECK_EQ(dto.i64, 922337203685477580LL);
     CHECK_EQ(dto.u64, 1844674407370955161ULL);
 
@@ -858,7 +1016,7 @@ TEST_CASE("Native nlohmann: Full 64-bit integer precision beyond double 2^53 man
         "u64": 18446744073709551615,
         "i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 0
     })";
-    auto dto_max = kale::bind_json_body<IntegerTargetsDTO, nlohmann::json>(max64_json);
+    auto dto_max = kale::bind_json<IntegerTargetsDTO, nlohmann::json>(max64_json);
     CHECK_EQ(dto_max.i64, std::numeric_limits<int64_t>::max());
     CHECK_EQ(dto_max.u64, std::numeric_limits<uint64_t>::max());
 }
@@ -870,7 +1028,7 @@ TEST_CASE("Native kale::Json: Numbers backed by Workflow double precision mantis
         "u64": 9007199254740991,
         "i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 0
     })";
-    auto dto_exact = kale::bind_json_body<IntegerTargetsDTO, kale::Json>(exact_double_json);
+    auto dto_exact = kale::bind_json<IntegerTargetsDTO, kale::Json>(exact_double_json);
     CHECK_EQ(dto_exact.i64, 9007199254740991LL);
     CHECK_EQ(dto_exact.u64, 9007199254740991ULL);
 
@@ -880,7 +1038,7 @@ TEST_CASE("Native kale::Json: Numbers backed by Workflow double precision mantis
         "u64": 1844674407370955161,
         "i8": 0, "u8": 0, "i16": 0, "u16": 0, "i32": 0, "u32": 0
     })";
-    auto dto_large = kale::bind_json_body<IntegerTargetsDTO, kale::Json>(large_json);
+    auto dto_large = kale::bind_json<IntegerTargetsDTO, kale::Json>(large_json);
     CHECK_EQ(dto_large.i64, static_cast<int64_t>(922337203685477580.0));
     CHECK_EQ(dto_large.u64, static_cast<uint64_t>(1844674407370955161.0));
 }
@@ -895,7 +1053,7 @@ TEST_CASE("Generic DTO: Duplicate key rejection across root, nested, array, and 
         })";
 
         try {
-            (void)kale::bind_json_body<SimpleAccountDTO, J>(dup_root);
+            (void)kale::bind_json<SimpleAccountDTO, J>(dup_root);
             FAIL("Expected duplicate key error at root");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "username");
@@ -924,7 +1082,7 @@ TEST_CASE("Generic DTO: Duplicate key rejection across root, nested, array, and 
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(dup_nested);
+            (void)kale::bind_json<GenericMasterDTO, J>(dup_nested);
             FAIL("Expected duplicate key error in nested object");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "item.title");
@@ -952,7 +1110,7 @@ TEST_CASE("Generic DTO: Duplicate key rejection across root, nested, array, and 
         })";
 
         try {
-            (void)kale::bind_json_body<GenericMasterDTO, J>(dup_array);
+            (void)kale::bind_json<GenericMasterDTO, J>(dup_array);
             FAIL("Expected duplicate key error in array element");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "items[1].title");
@@ -970,7 +1128,7 @@ TEST_CASE("Generic DTO: Duplicate key rejection across root, nested, array, and 
         })";
 
         try {
-            (void)kale::bind_json_body<SimpleAccountDTO, J>(dup_unknown_root);
+            (void)kale::bind_json<SimpleAccountDTO, J>(dup_unknown_root);
             FAIL("Expected duplicate key error for unknown root key");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "ignored_extra");
@@ -990,7 +1148,7 @@ TEST_CASE("Generic DTO: Duplicate key rejection across root, nested, array, and 
         })";
 
         try {
-            (void)kale::bind_json_body<SimpleAccountDTO, J>(dup_ignored_subtree);
+            (void)kale::bind_json<SimpleAccountDTO, J>(dup_ignored_subtree);
             FAIL("Expected duplicate key error in ignored subtree");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "ignored_subtree.sub_dup");
@@ -1008,7 +1166,7 @@ TEST_CASE("Generic DTO: Duplicate key rejection across root, nested, array, and 
             "extra_obj": {"a": 1, "b": 2}
         })";
 
-        auto dto_valid = kale::bind_json_body<SimpleAccountDTO, J>(valid_unknowns);
+        auto dto_valid = kale::bind_json<SimpleAccountDTO, J>(valid_unknowns);
         CHECK_EQ(dto_valid.username, "alice");
         CHECK_EQ(dto_valid.age, 30);
     };
@@ -1036,7 +1194,7 @@ TEST_CASE("Generic DTO: Raw JSON field survival and independent lifetime") {
                 }
             })";
 
-            dto = kale::bind_json_body<RawPayloadDTO<J>, J>(raw_input);
+            dto = kale::bind_json<RawPayloadDTO<J>, J>(raw_input);
         }
 
         // After raw_input is destroyed, dto.payload must survive and remain valid
@@ -1063,11 +1221,33 @@ TEST_CASE("Generic DTO: Raw JSON field survival and independent lifetime") {
     }
 }
 
+TEST_CASE("Generic DTO Writer: Raw JSON field serialization") {
+    auto run_test = []<typename J>() {
+        RawPayloadDTO<J> raw_dto;
+        raw_dto.tag = "meta";
+        raw_dto.payload = J::parse(R"({"nested":123,"ok":true})");
+        J raw_json = kale::to_json<RawPayloadDTO<J>, J>(raw_dto);
+        CHECK_EQ(raw_json["tag"].template get<std::string>(), "meta");
+        CHECK_EQ(raw_json["payload"]["nested"].template get<int>(), 123);
+        CHECK(raw_json["payload"]["ok"].template get<bool>());
+    };
+
+    SUBCASE("kale::Json") {
+        run_test.template operator()<kale::Json>();
+    }
+    SUBCASE("nlohmann::json") {
+        run_test.template operator()<nlohmann::json>();
+    }
+    SUBCASE("nlohmann::ordered_json") {
+        run_test.template operator()<nlohmann::ordered_json>();
+    }
+}
+
 TEST_CASE("Generic DTO: Empty body, non-object root, and syntax error rejection") {
     auto run_test = []<typename J>() {
         // Empty body
         try {
-            (void)kale::bind_json_body<SimpleAccountDTO, J>("");
+            (void)kale::bind_json<SimpleAccountDTO, J>("");
             FAIL("Expected error on empty body");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "_root");
@@ -1077,7 +1257,7 @@ TEST_CASE("Generic DTO: Empty body, non-object root, and syntax error rejection"
 
         // Non-object root: array
         try {
-            (void)kale::bind_json_body<SimpleAccountDTO, J>("[1, 2, 3]");
+            (void)kale::bind_json<SimpleAccountDTO, J>("[1, 2, 3]");
             FAIL("Expected error on array root");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "_root");
@@ -1087,7 +1267,7 @@ TEST_CASE("Generic DTO: Empty body, non-object root, and syntax error rejection"
 
         // Non-object root: string
         try {
-            (void)kale::bind_json_body<SimpleAccountDTO, J>("\"just a string\"");
+            (void)kale::bind_json<SimpleAccountDTO, J>("\"just a string\"");
             FAIL("Expected error on string root");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "_root");
@@ -1097,7 +1277,7 @@ TEST_CASE("Generic DTO: Empty body, non-object root, and syntax error rejection"
 
         // Malformed JSON syntax
         try {
-            (void)kale::bind_json_body<SimpleAccountDTO, J>("{broken_json: 123");
+            (void)kale::bind_json<SimpleAccountDTO, J>("{broken_json: 123");
             FAIL("Expected error on malformed syntax");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "_root");
@@ -1123,16 +1303,16 @@ TEST_CASE("Generic HTTP Context Binding: Service zero execution on validation fa
     std::atomic<int> kale_service_invoked{0};
     std::atomic<int> nloh_service_invoked{0};
 
-    // Route 1: kale::Json binding via Context::bind_json<DTO, kale::Json>()
+    // Route 1: kale::Json binding via kale::bind_json<DTO, kale::Json>()
     fixture->POST("/api/bind/kale", [&kale_service_invoked](kale::Context &ctx) {
-        auto dto = ctx.bind_json<SimpleAccountDTO, kale::Json>();
+        auto dto = kale::bind_json<SimpleAccountDTO, kale::Json>(ctx);
         kale_service_invoked.fetch_add(1);
         ctx.string("kale_user:" + dto.username + ":" + std::to_string(dto.age));
     });
 
-    // Route 2: nlohmann::json binding via Context::bind_json<DTO, nlohmann::json>()
+    // Route 2: nlohmann::json binding via kale::bind_json<DTO, nlohmann::json>()
     fixture->POST("/api/bind/nloh", [&nloh_service_invoked](kale::Context &ctx) {
-        auto dto = ctx.bind_json<SimpleAccountDTO, nlohmann::json>();
+        auto dto = kale::bind_json<SimpleAccountDTO, nlohmann::json>(ctx);
         nloh_service_invoked.fetch_add(1);
         ctx.string("nloh_user:" + dto.username + ":" + std::to_string(dto.age));
     });
@@ -1250,7 +1430,7 @@ TEST_CASE("Third User-Defined Type: Alternate basic_json instantiation and HTTP 
         "numbers": [10, 20],
         "items": [{"title": "i1", "code": 1}]
     })";
-    auto dto = kale::bind_json_body<GenericMasterDTO, nlohmann::ordered_json>(valid_json);
+    auto dto = kale::bind_json<GenericMasterDTO, nlohmann::ordered_json>(valid_json);
     CHECK_EQ(dto.name, "Ordered User");
     CHECK_EQ(dto.age, 30);
     CHECK_EQ(dto.count, 100);
@@ -1270,22 +1450,22 @@ TEST_CASE("Third User-Defined Type: Alternate basic_json instantiation and HTTP 
 
     // 2. Duplicate key rejection across root, nested, array, and ignored subtrees
     std::string dup_root = R"({"username":"alice","username":"bob","age":30})";
-    CHECK_THROWS_AS((kale::bind_json_body<SimpleAccountDTO, nlohmann::ordered_json>(dup_root)), kale::JsonBindError);
+    CHECK_THROWS_AS((kale::bind_json<SimpleAccountDTO, nlohmann::ordered_json>(dup_root)), kale::JsonBindError);
 
     std::string dup_nested = R"({"name":"test","item":{"title":"a","title":"b","code":2}})";
-    CHECK_THROWS_AS((kale::bind_json_body<GenericMasterDTO, nlohmann::ordered_json>(dup_nested)), kale::JsonBindError);
+    CHECK_THROWS_AS((kale::bind_json<GenericMasterDTO, nlohmann::ordered_json>(dup_nested)), kale::JsonBindError);
 
     std::string dup_array = R"({"name":"test","items":[{"title":"t1","code":1},{"title":"a","title":"b","code":2}]})";
-    CHECK_THROWS_AS((kale::bind_json_body<GenericMasterDTO, nlohmann::ordered_json>(dup_array)), kale::JsonBindError);
+    CHECK_THROWS_AS((kale::bind_json<GenericMasterDTO, nlohmann::ordered_json>(dup_array)), kale::JsonBindError);
 
     std::string dup_ignored = R"({"title":"alice","code":30,"ignored":{"dup":1,"dup":2}})";
-    CHECK_THROWS_AS((kale::bind_json_body<GenericItemDTO, nlohmann::ordered_json>(dup_ignored)), kale::JsonBindError);
+    CHECK_THROWS_AS((kale::bind_json<GenericItemDTO, nlohmann::ordered_json>(dup_ignored)), kale::JsonBindError);
 
     // 3. HTTP Server route with actual parse, bind, and JSON output (dump)
     GenericServerFixture fixture;
     std::atomic<int> ordered_service_invoked{0};
     fixture->POST("/api/ordered_json/test", [&ordered_service_invoked](kale::Context &ctx) {
-        auto item = ctx.bind_json<GenericItemDTO, nlohmann::ordered_json>();
+        auto item = kale::bind_json<GenericItemDTO, nlohmann::ordered_json>(ctx);
         ordered_service_invoked.fetch_add(1);
         nlohmann::ordered_json resp;
         resp["echo_title"] = item.title;
@@ -1309,4 +1489,107 @@ TEST_CASE("Third User-Defined Type: Alternate basic_json instantiation and HTTP 
     CHECK_EQ(err_res.status, 400);
     CHECK_EQ(ordered_service_invoked.load(), 1);
 }
+
+TEST_CASE("Direct DTO writer: default bind_json<DTO> and zero-DOM dump_json") {
+    // 1. A single template argument defaults J to kale::Json.
+    auto account = kale::bind_json<SimpleAccountDTO>(R"({"username":"dana","age":33})");
+    CHECK_EQ(account.username, "dana");
+    CHECK_EQ(account.age, 33);
+
+    struct DirectWriteDTO {
+        int64_t i64{0};
+        uint64_t u64{0};
+        bool flag{false};
+        std::optional<int> maybe;
+        std::optional<std::string> absent;
+        std::vector<std::string> tags;
+
+        KALE_BIND(
+            KALE_FIELD(i64),
+            KALE_FIELD(u64),
+            KALE_FIELD(flag),
+            KALE_FIELD(maybe),
+            KALE_FIELD(absent),
+            KALE_FIELD(tags)
+        )
+    };
+
+    DirectWriteDTO src;
+    src.i64 = std::numeric_limits<int64_t>::max();
+    src.u64 = std::numeric_limits<uint64_t>::max();
+    src.flag = true;
+    src.tags = {std::string("a\"b"), std::string("line\nbreak"), std::string("ctrl\x01")};
+
+    // 2. Full 64-bit fidelity proves the values never passed through a double-backed DOM.
+    const std::string compact = kale::dump_json(src);
+    CHECK_EQ(compact,
+             "{\"i64\":9223372036854775807,\"u64\":18446744073709551615,\"flag\":true,"
+             "\"tags\":[\"a\\\"b\",\"line\\nbreak\",\"ctrl\\u0001\"]}");
+    CHECK_EQ(compact.find('\n'), std::string::npos);
+
+    // 3. The explicit writer type produces identical output.
+    CHECK_EQ((kale::dump_json<DirectWriteDTO, kale::Json>(src)), compact);
+
+    auto parsed = nlohmann::json::parse(compact);
+    CHECK_EQ(parsed["i64"].template get<int64_t>(), std::numeric_limits<int64_t>::max());
+    CHECK_EQ(parsed["u64"].template get<uint64_t>(), std::numeric_limits<uint64_t>::max());
+    CHECK(parsed["flag"].template get<bool>());
+    REQUIRE_EQ(parsed["tags"].size(), 3);
+    CHECK_EQ(parsed["tags"][0].template get<std::string>(), "a\"b");
+    CHECK_EQ(parsed["tags"][1].template get<std::string>(), "line\nbreak");
+    CHECK_EQ(parsed["tags"][2].template get<std::string>(), "ctrl\x01");
+    CHECK_FALSE(parsed.contains("maybe"));
+    CHECK_FALSE(parsed.contains("absent"));
+
+    // 4. The JsonWriteOptions overload emits nulls when requested.
+    const std::string emitted = kale::dump_json(
+        src, kale::JsonWriteOptions{.optional_null = kale::OptionalNullPolicy::EmitNull});
+    auto emitted_doc = nlohmann::json::parse(emitted);
+    CHECK(emitted_doc["maybe"].is_null());
+    CHECK(emitted_doc["absent"].is_null());
+    CHECK_EQ(emitted_doc["tags"], parsed["tags"]);
+
+    // 5. Pretty printing uses standard JSON layout.
+    const std::string pretty = kale::dump_json(src, 2);
+    CHECK_EQ(pretty.rfind("{\n  \"i64\": 9223372036854775807,", 0), 0u);
+    CHECK(std::string_view(pretty).ends_with("\n}"));
+    CHECK_EQ(nlohmann::json::parse(pretty), parsed);
+
+    // 6. Raw JSON fields are embedded through a single J::dump() call.
+    struct DirectRawDTO {
+        std::string tag;
+        nlohmann::json payload;
+
+        KALE_BIND(
+            KALE_FIELD(tag),
+            KALE_FIELD(payload)
+        )
+    };
+
+    DirectRawDTO raw;
+    raw.tag = "meta";
+    raw.payload = nlohmann::json::parse(R"({"nested":123,"ok":true})");
+    const std::string raw_compact = kale::dump_json<DirectRawDTO, nlohmann::json>(raw);
+    CHECK_EQ(raw_compact.find('\n'), std::string::npos);
+    auto raw_doc = nlohmann::json::parse(raw_compact);
+    CHECK_EQ(raw_doc["tag"].template get<std::string>(), "meta");
+    CHECK_EQ(raw_doc["payload"]["nested"].template get<int>(), 123);
+    CHECK(raw_doc["payload"]["ok"].template get<bool>());
+
+    // 7. Non-finite double in raw kale::Json field throws std::invalid_argument
+    struct KaleRawDTO {
+        kale::Json payload;
+        KALE_BIND(KALE_FIELD(payload))
+    };
+    KaleRawDTO inf_dto;
+    inf_dto.payload = kale::Json::Object{{"x", std::numeric_limits<double>::infinity()}};
+    CHECK_THROWS_AS(kale::dump_json(inf_dto), std::invalid_argument);
+
+    // 8. Pretty-printed dump_json indents multiline raw JSON fields to match parent level
+    KaleRawDTO pretty_raw_dto;
+    pretty_raw_dto.payload = kale::Json::Object{{"nested", kale::Json::Array{1, 2}}};
+    const std::string pretty_raw = kale::dump_json(pretty_raw_dto, 2);
+    CHECK(pretty_raw.find("  \"payload\": {\n    \"nested\": [\n      1,\n      2\n    ]\n  }") != std::string::npos);
+}
+
 } // TEST_SUITE("generic_binding")

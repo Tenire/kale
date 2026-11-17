@@ -10,6 +10,7 @@
 #include "kale/core/context.h"
 #include "kale/core/http_server.h"
 #include "kale/core/http_status.h"
+#include "kale/core/http_util.h"
 #include "kale/http/json.h"
 
 namespace {
@@ -24,23 +25,6 @@ std::string get_upstream_url() {
         return s;
     }
     return "http://127.0.0.1:8080";
-}
-
-std::string percent_encode(std::string_view input) {
-    static constexpr char hex_chars[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(input.size() * 3);
-    for (unsigned char c : input) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
-            out.push_back(static_cast<char>(c));
-        } else {
-            out.push_back('%');
-            out.push_back(hex_chars[(c >> 4) & 0x0F]);
-            out.push_back(hex_chars[c & 0x0F]);
-        }
-    }
-    return out;
 }
 } // namespace
 
@@ -113,7 +97,7 @@ int main(int argc, char *argv[]) {
         // 2. Fetch parametrized coroutine endpoint (pairs with hello's GET /async?name=...)
         server.GET("/greet", [&client, upstream_base](kale::Context &ctx) -> coke::Task<void> {
             std::string name = ctx.default_query("name", "World");
-            std::string target_url = upstream_base + "/async?name=" + percent_encode(name);
+            std::string target_url = upstream_base + "/async?name=" + kale::url_encode(name);
 
             try {
                 auto response = co_await client.get(target_url)

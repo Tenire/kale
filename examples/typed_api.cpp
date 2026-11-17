@@ -11,7 +11,7 @@
 #include "kale/middleware/error_handler.h"
 #include "kale/core/http_server.h"
 #include "kale/core/http_status.h"
-#include "kale/http/binding.h"
+#include "kale/http/json_writer.h"
 #include "kale/http/field_desc.h"
 #include "kale/http/json.h"
 #include "kale/http/json_reader.h"
@@ -158,7 +158,7 @@ int main(int argc, char *argv[]) {
         // 1. POST /api/v1/products/validate - Declarative DTO Field Validation
         server.POST("/api/v1/products/validate", [](kale::Context &ctx) -> coke::Task<void> {
             // Type-safe DTO binding against native Kale JSON; throws JsonBindError on constraint failure
-            auto dto = ctx.bind_json<ProductValidationDTO>();
+            auto dto = kale::bind_json<ProductValidationDTO>(ctx);
 
             kale::Json::Object receipt{
                 {"status", "valid"},
@@ -187,7 +187,7 @@ int main(int argc, char *argv[]) {
 
         // 2. POST /api/v1/orders/quote - Order Pricing & Domain Boundary Check
         server.POST("/api/v1/orders/quote", [](kale::Context &ctx) -> coke::Task<void> {
-            auto req_dto = ctx.bind_json<OrderQuoteRequestDTO>();
+            auto req_dto = kale::bind_json<OrderQuoteRequestDTO>(ctx);
 
             // Business rule checks demonstrating Domain Error Boundaries:
             if (req_dto.sku == "NOTFOUND01" || req_dto.sku == "NONE0000") {
@@ -211,18 +211,18 @@ int main(int argc, char *argv[]) {
 
             double total = subtotal - discount;
 
-            kale::Json::Object quote{
-                {"sku", req_dto.sku},
-                {"quantity", req_dto.quantity},
-                {"unit_price", unit_price},
-                {"subtotal", subtotal},
-                {"discount", discount},
-                {"total", total},
-                {"customer_email", req_dto.customer_email}
+            OrderQuoteResponseDTO resp_dto{
+                .sku = req_dto.sku,
+                .quantity = req_dto.quantity,
+                .unit_price = unit_price,
+                .subtotal = subtotal,
+                .discount = discount,
+                .total = total,
+                .customer_email = req_dto.customer_email
             };
 
             ctx.set_status(kale::HttpStatus::OK);
-            ctx.json(quote);
+            ctx.json(kale::dump_json(resp_dto));
             co_return;
         });
 

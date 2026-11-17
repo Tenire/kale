@@ -14,7 +14,7 @@
 #include "kale/core/logger.h"
 #include "kale/http/field_desc.h"
 #include "kale/http/json_reader.h"
-#include "kale/http/binding.h"
+#include "kale/http/json_writer.h"
 #include <atomic>
 #include <charconv>
 #include <map>
@@ -260,7 +260,7 @@ TEST_CASE("Phase 1: Precise headers provide required functional types") {
     CHECK_EQ(bp.routes().size(), 1);
     // 5. kale/middleware/error_handler.h provides self-contained error_handler middleware
     auto eh_mw = kale::error_handler();
-    // 6. kale/http/binding.h provides self-contained JsonBindError deriving JsonInputError and Context::bind_json
+    // 6. kale/http/json_reader.h provides self-contained JsonBindError deriving JsonInputError and kale::bind_json(const Context&)
     kale::JsonBindError bind_err("test_field", "unique key", "duplicate object key in JSON");
     CHECK_EQ(bind_err.field(), "test_field");
     CHECK_EQ(bind_err.expected(), "unique key");
@@ -553,7 +553,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
             // Parse DTO inside nested scope so any local JSON parser structures are destroyed
             UserProfileDTO parsed_dto;
             {
-                parsed_dto = ctx.bind_json<UserProfileDTO>();
+                parsed_dto = kale::bind_json<UserProfileDTO>(ctx);
             }
 
             // Retain post-bind lifetime assertion: copy from parsed DTO after bind scope exits
@@ -616,7 +616,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -650,7 +650,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -685,7 +685,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -719,7 +719,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -753,7 +753,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -777,7 +777,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -804,7 +804,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -826,7 +826,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -859,7 +859,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         LayerServerFixture fixture;
         fixture->POST("/bind", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -893,7 +893,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         std::atomic<bool> service_invoked{false};
 
         fixture->POST("/users/account", [&service_invoked](kale::Context &ctx) {
-            auto dto = ctx.bind_json<UserAccountDTO>();
+            auto dto = kale::bind_json<UserAccountDTO>(ctx);
             // Business service:
             service_invoked.store(true);
             ctx.string("user:" + dto.username);
@@ -918,7 +918,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         // 3. Inspect structured JsonBindError directly at root
         fixture->POST("/users/account/inspect", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserAccountDTO>();
+                auto dto = kale::bind_json<UserAccountDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -943,7 +943,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         std::atomic<bool> service_invoked{false};
 
         fixture->POST("/users/nested-dup", [&service_invoked](kale::Context &ctx) {
-            auto dto = ctx.bind_json<UserProfileDTO>();
+            auto dto = kale::bind_json<UserProfileDTO>(ctx);
             // Business service:
             service_invoked.store(true);
             ctx.string("ok");
@@ -973,7 +973,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
         // Inspect structured JsonBindError directly on nested object
         fixture->POST("/users/nested-dup/inspect", [](kale::Context &ctx) {
             try {
-                auto dto = ctx.bind_json<UserProfileDTO>();
+                auto dto = kale::bind_json<UserProfileDTO>(ctx);
                 ctx.string("ok");
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
@@ -996,7 +996,7 @@ TEST_CASE("Phase 4: DTO valid binding and full validation failure coverage") {
     SUBCASE("Unknown keys that are not duplicated remain ignored by default") {
         LayerServerFixture fixture;
         fixture->POST("/users/unknown-keys", [](kale::Context &ctx) {
-            auto dto = ctx.bind_json<UserAccountDTO>();
+            auto dto = kale::bind_json<UserAccountDTO>(ctx);
             ctx.string("user:" + dto.username + ",age:" + std::to_string(dto.age));
         });
 
@@ -1266,11 +1266,11 @@ TEST_CASE("Phase 3: Base exception mapping dynamic derived info preservation") {
     CHECK(typeid_matched_derived);
     CHECK(derived_code_observed == 999);
 }
-TEST_CASE("Phase 4: Context::bind_json exception classification and standard 400 Bad Request mapping") {
+TEST_CASE("Phase 4: kale::bind_json exception classification and standard 400 Bad Request mapping") {
     SUBCASE("Uncaught JsonBindError maps to standard 400 Bad Request with framing length 11") {
         LayerServerFixture fixture;
         fixture->POST("/bind_uncaught", [](kale::Context &ctx) {
-            auto dto = ctx.bind_json<UserAccountDTO>();
+            auto dto = kale::bind_json<UserAccountDTO>(ctx);
             ctx.string("ok:" + dto.username);
         });
 

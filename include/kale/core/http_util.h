@@ -38,6 +38,9 @@ bool is_valid_status_code(int status) noexcept;
 
 bool is_valid_reason_phrase(std::string_view phrase) noexcept;
 
+// Query percent-encoding (space encodes as %20).
+std::string url_encode(std::string_view str);
+
 // Form query decoding ('+' decodes to space).
 std::string url_decode(std::string_view str);
 

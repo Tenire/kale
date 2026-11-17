@@ -10,7 +10,7 @@ Source code: [`../examples/typed_api.cpp`](../examples/typed_api.cpp)
 
 The `example_typed_api` service implements a Product Validation and Order Quotation service that demonstrates:
 - Declarative DTO field descriptors using `KALE_BIND` and `KALE_FIELD`.
-- Strong-typed JSON body binding via `ctx.bind_json<DTO>()`.
+- Strong-typed JSON body binding via `kale::bind_json<DTO>(ctx)`.
 - Compile-time constraint validation using `kale::rules::*`.
 - Application exception mapping via `kale::HttpError` and `kale::reply_error`.
 - Real OpenAPI 3.0.3 specification generation (`kale::generate_openapi`) from registered route graphs and DTO schemas.
@@ -501,7 +501,7 @@ Expected Response (`200 OK`):
 
 ## 8. Generic Reader & Third-Party JSON Customization
 
-The DTO binding engine in `kale/http/json_reader.h` is generic across JSON parsers and can be called directly as a free function or via `ctx.bind_json<DTO, J>()`:
+The DTO binding engine in `kale/http/json_reader.h` is generic across JSON parsers and can be called directly as a free function or via `kale::bind_json<DTO, J>(ctx)`:
 
 ```cpp
 #include <optional>
@@ -518,7 +518,7 @@ The DTO binding engine in `kale/http/json_reader.h` is generic across JSON parse
 // #include "kale/core/context.h"
 // #include "kale/core/http_server.h"
 // #include "kale/core/http_status.h"
-// #include "kale/http/binding.h"
+// #include "kale/http/json_writer.h"
 // #include "kale/http/field_desc.h"
 // #include "kale/http/json.h"
 // #include "kale/http/json_reader.h"
@@ -537,16 +537,23 @@ struct ProductValidationDTO {
 
 template <typename DTO, typename J = kale::Json>
 DTO parse_dto_from_raw_json(std::string_view raw_json) {
-    return kale::bind_json_body<DTO, J>(raw_json);
+    return kale::bind_json<DTO, J>(raw_json);
 }
 
 void register_generic_bind_route(kale::HttpServer &server) {
     server.POST("/api/custom-bind", [](kale::Context &ctx) -> coke::Task<void> {
-        auto dto = ctx.bind_json<ProductValidationDTO, kale::Json>();
+        auto dto = kale::bind_json<ProductValidationDTO, kale::Json>(ctx);
         ctx.set_status(kale::HttpStatus::OK);
-        ctx.json(kale::Json::Object{{"status", "bound_successfully"}});
+        // Direct DTO-to-JSON string serialization (no intermediate DOM built):
+        ctx.json(kale::dump_json(dto));
         co_return;
     });
 }
 ```
 `JsonReader<J>` uses C++20 concepts to detect methods (`.contains()`, `.is_string()`, `.get<T>()`, `.is_number()`) on custom JSON types (such as `nlohmann::json` or `nlohmann::ordered_json`) without requiring extra adapter wrappers.
+
+`J` defaults to `kale::Json`, so `kale::bind_json<DTO>(raw_json)` works once `<kale/http/json.h>` (or `<kale/api.h>`) is included. When only `<kale/http/json_reader.h>` is included, spell the JSON type explicitly.
+
+`kale::dump_json<DTO>(dto, spaces, opts)` (in `<kale/http/json_writer.h>`) writes the DTO straight into a `std::string`; no intermediate `J` tree is built, so there are no per-node allocations and no key lookups.
+
+Direct serialization preserves full 64-bit `int64_t` / `uint64_t` precision (a DOM backed by doubles would round those values) and throws instead of emitting invalid JSON for non-finite floating-point fields. `kale::to_json<DTO, J>(dto)` remains available when an actual `J` DOM object is required.

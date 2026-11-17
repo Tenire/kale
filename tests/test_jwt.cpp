@@ -3,7 +3,6 @@
 #include "coke/http/http_client.h"
 #include "coke/wait.h"
 #include "kale/core/http_server.h"
-#include "kale/core/http_error.h"
 #include "kale/core/http_util.h"
 #include "kale/security/jwt.h"
 #include "http/base64.h"
@@ -63,6 +62,28 @@ KeyPair generate_rsa_keypair(int bits = 2048) {
     EVP_PKEY *pkey = nullptr;
     EVP_PKEY_keygen(pctx, &pkey);
     EVP_PKEY_CTX_free(pctx);
+
+    BIO *priv_bio = BIO_new(BIO_s_mem());
+    PEM_write_bio_PrivateKey(priv_bio, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+    BUF_MEM *priv_bptr = nullptr;
+    BIO_get_mem_ptr(priv_bio, &priv_bptr);
+    std::string priv_str(priv_bptr->data, priv_bptr->length);
+    BIO_free(priv_bio);
+
+    BIO *pub_bio = BIO_new(BIO_s_mem());
+    PEM_write_bio_PUBKEY(pub_bio, pkey);
+    BUF_MEM *pub_bptr = nullptr;
+    BIO_get_mem_ptr(pub_bio, &pub_bptr);
+    std::string pub_str(pub_bptr->data, pub_bptr->length);
+    BIO_free(pub_bio);
+
+    EVP_PKEY_free(pkey);
+    return {priv_str, pub_str};
+}
+
+KeyPair generate_ec_keypair(const char *curve_name = "P-256") {
+    EVP_PKEY *pkey = EVP_EC_gen(curve_name);
+    REQUIRE(pkey != nullptr);
 
     BIO *priv_bio = BIO_new(BIO_s_mem());
     PEM_write_bio_PrivateKey(priv_bio, pkey, nullptr, nullptr, 0, nullptr, nullptr);
@@ -742,4 +763,156 @@ TEST_CASE("BearerAuth HTTP Server E2E") {
     }
 }
 
+
+TEST_CASE("JWA asymmetric ES256 P-256 sign, verify, and rejection matrix") {
+    auto p256_keys = generate_ec_keypair("P-256");
+    auto p384_keys = generate_ec_keypair("P-384");
+    auto rsa_keys = generate_rsa_keypair(2048);
+
+    kale::JwtClaims claims;
+    claims.set_issuer("ec-issuer")
+          .set_subject("dave")
+          .set_expires_at(1800000000);
+
+    // 1. Valid P-256 sign & verify with fixed 64-byte R || S (86-char Base64URL)
+    auto sign_res = kale::JwtSigner::sign_pem(
+        claims, p256_keys.private_key_pem, kale::JwtAlgorithm::ES256, "ec-k1");
+    REQUIRE(sign_res.has_value());
+    std::string token = *sign_res;
+
+    size_t last_dot = token.rfind('.');
+    REQUIRE_NE(last_dot, std::string::npos);
+    std::string_view sig_b64 = std::string_view(token).substr(last_dot + 1);
+    CHECK_EQ(sig_b64.size(), 86);
+
+    kale::JwtValidator validator;
+    validator.allow_algorithm(kale::JwtAlgorithm::ES256)
+             .require_issuer("ec-issuer")
+             .require_subject("dave")
+             .set_clock([]() -> int64_t { return 1750000000; });
+
+    auto verify_res = validator.verify_pem(token, p256_keys.public_key_pem);
+    REQUIRE(verify_res.has_value());
+    CHECK_EQ(verify_res->algorithm(), kale::JwtAlgorithm::ES256);
+    CHECK_EQ(verify_res->token_type(), "JWT");
+    CHECK_EQ(verify_res->kid(), "ec-k1");
+    CHECK_EQ(verify_res->issuer(), "ec-issuer");
+    CHECK_EQ(verify_res->subject(), "dave");
+
+    // 2. Wrong curve (P-384) and RSA key rejected on both sign and verify
+    CHECK_EQ(kale::JwtSigner::sign_pem(claims, p384_keys.private_key_pem, kale::JwtAlgorithm::ES256).error,
+             kale::JwtError::KeyInvalid);
+    CHECK_EQ(kale::JwtSigner::sign_pem(claims, rsa_keys.private_key_pem, kale::JwtAlgorithm::ES256).error,
+             kale::JwtError::KeyInvalid);
+    CHECK_EQ(validator.verify_pem(token, p384_keys.public_key_pem).error,
+             kale::JwtError::KeyInvalid);
+    CHECK_EQ(validator.verify_pem(token, rsa_keys.public_key_pem).error,
+             kale::JwtError::KeyInvalid);
+
+    // 3. Signature tamper and invalid length rejection
+    std::string tampered = token;
+    tampered.back() = (tampered.back() == 'A') ? 'B' : 'A';
+    CHECK_EQ(validator.verify_pem(tampered, p256_keys.public_key_pem).error,
+             kale::JwtError::SignatureMismatch);
+
+    std::string short_sig = token.substr(0, token.size() - 2);
+    CHECK_EQ(validator.verify_pem(short_sig, p256_keys.public_key_pem).error,
+             kale::JwtError::SignatureMismatch);
+
+    // 4. HMAC / PEM confusion rejection
+    std::string secret = "kale_super_secret_key_1234567890_abcdefghijklmnopqrstuvwxyz_0123456789";
+    CHECK_EQ(kale::JwtSigner::sign_hmac(claims, secret, kale::JwtAlgorithm::ES256).error,
+             kale::JwtError::AlgorithmNotAllowed);
+    CHECK_EQ(validator.verify_hmac(token, secret).error,
+             kale::JwtError::AlgorithmNotAllowed);
+}
+
+TEST_CASE("Header typ validation, kid validation, and VerifiedJwtClaims scalar accessors") {
+    std::string secret = "kale_super_secret_key_1234567890_abcdefghijklmnopqrstuvwxyz_0123456789";
+    auto p256_keys = generate_ec_keypair("P-256");
+
+    kale::JwtClaims claims;
+    claims.set_issuer("auth")
+          .set_subject("eve")
+          .set_expires_at(1800000000);
+
+    // 1. Empty typ rejected at signing time
+    CHECK_EQ(kale::JwtSigner::sign_hmac(claims, secret, kale::JwtAlgorithm::HS256, "k1", "").error,
+             kale::JwtError::MalformedToken);
+    CHECK_EQ(kale::JwtSigner::sign_pem(claims, p256_keys.private_key_pem, kale::JwtAlgorithm::ES256, "k1", "").error,
+             kale::JwtError::MalformedToken);
+
+    // 2. Custom typ ("at+jwt") and kid ("key-2026-01")
+    auto at_res = kale::JwtSigner::sign_pem(
+        claims, p256_keys.private_key_pem, kale::JwtAlgorithm::ES256, "key-2026-01", "at+jwt");
+    REQUIRE(at_res.has_value());
+    std::string at_token = *at_res;
+
+    kale::JwtValidator at_validator;
+    at_validator.allow_algorithm(kale::JwtAlgorithm::ES256)
+                .require_type("at+jwt")
+                .require_kid("key-2026-01")
+                .set_clock([]() -> int64_t { return 1750000000; });
+
+    auto ok = at_validator.verify_pem(at_token, p256_keys.public_key_pem);
+    REQUIRE(ok.has_value());
+    CHECK_EQ(ok->algorithm(), kale::JwtAlgorithm::ES256);
+    CHECK_EQ(ok->token_type(), "at+jwt");
+    CHECK_EQ(ok->kid(), "key-2026-01");
+
+    // 3. typ mismatch ("JWT" token against require_type("at+jwt"))
+    auto jwt_res = kale::JwtSigner::sign_pem(
+        claims, p256_keys.private_key_pem, kale::JwtAlgorithm::ES256, "key-2026-01", "JWT");
+    REQUIRE(jwt_res.has_value());
+    CHECK_EQ(at_validator.verify_pem(*jwt_res, p256_keys.public_key_pem).error,
+             kale::JwtError::TypeMismatch);
+
+    // 4. kid mismatch and missing kid
+    auto other_kid_res = kale::JwtSigner::sign_pem(
+        claims, p256_keys.private_key_pem, kale::JwtAlgorithm::ES256, "other-kid", "at+jwt");
+    REQUIRE(other_kid_res.has_value());
+    CHECK_EQ(at_validator.verify_pem(*other_kid_res, p256_keys.public_key_pem).error,
+             kale::JwtError::KidMismatch);
+
+    auto no_kid_res = kale::JwtSigner::sign_pem(
+        claims, p256_keys.private_key_pem, kale::JwtAlgorithm::ES256, "", "at+jwt");
+    REQUIRE(no_kid_res.has_value());
+    CHECK_EQ(at_validator.verify_pem(*no_kid_res, p256_keys.public_key_pem).error,
+             kale::JwtError::KidMismatch);
+
+    // 5. Missing/invalid typ or non-string kid in raw header
+    auto make_hmac_token = [&](std::string_view hdr_json) {
+        std::string h_b64 = kale::Base64::encode_url(hdr_json);
+        std::string p_b64 = kale::Base64::encode_url(claims.dump());
+        std::string input = h_b64 + "." + p_b64;
+        return input + "." + kale::CryptoUtil::hmac_sha256_base64url(input, secret);
+    };
+
+    kale::JwtValidator hmac_plain;
+    hmac_plain.allow_algorithm(kale::JwtAlgorithm::HS256)
+              .set_clock([]() -> int64_t { return 1750000000; });
+
+    CHECK_EQ(hmac_plain.verify_hmac(make_hmac_token("{\"alg\":\"HS256\",\"typ\":123}"), secret).error,
+             kale::JwtError::TypeMismatch);
+    CHECK_EQ(hmac_plain.verify_hmac(make_hmac_token("{\"alg\":\"HS256\",\"typ\":\"\"}"), secret).error,
+             kale::JwtError::TypeMismatch);
+    CHECK_EQ(hmac_plain.verify_hmac(make_hmac_token("{\"alg\":\"HS256\",\"kid\":42}"), secret).error,
+             kale::JwtError::KidMismatch);
+
+    kale::JwtValidator hmac_req_typ;
+    hmac_req_typ.allow_algorithm(kale::JwtAlgorithm::HS256)
+                .require_type("JWT")
+                .set_clock([]() -> int64_t { return 1750000000; });
+    CHECK_EQ(hmac_req_typ.verify_hmac(make_hmac_token("{\"alg\":\"HS256\"}"), secret).error,
+             kale::JwtError::TypeMismatch);
+
+    // 6. Embedded NUL (\u0000) in typ or kid must be rejected
+    CHECK_EQ(hmac_req_typ.verify_hmac(make_hmac_token("{\"alg\":\"HS256\",\"typ\":\"JWT\\u0000other\"}"), secret).error, kale::JwtError::InvalidJson);
+
+    kale::JwtValidator hmac_req_kid;
+    hmac_req_kid.allow_algorithm(kale::JwtAlgorithm::HS256)
+                .require_kid("k1")
+                .set_clock([]() -> int64_t { return 1750000000; });
+    CHECK_EQ(hmac_req_kid.verify_hmac(make_hmac_token("{\"alg\":\"HS256\",\"kid\":\"k1\\u0000other\"}"), secret).error, kale::JwtError::InvalidJson);
+}
 } // TEST_SUITE("jwt")

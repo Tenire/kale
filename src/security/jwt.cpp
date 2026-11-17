@@ -11,6 +11,10 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
+#include <openssl/ecdsa.h>
+#include <openssl/objects.h>
 #include <workflow/HttpMessage.h>
 #include <workflow/HttpUtil.h>
 #include <workflow/json_parser.h>
@@ -26,6 +30,27 @@
 namespace kale {
 
 namespace {
+bool contains_json_null_escape_or_byte(std::string_view s) noexcept {
+    if (s.find('\0') != std::string_view::npos) {
+        return true;
+    }
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\') {
+            size_t bs = 0;
+            size_t j = i;
+            while (j < s.size() && s[j] == '\\') {
+                ++bs;
+                ++j;
+            }
+            if ((bs % 2) == 1 && (j - 1) + 6 <= s.size() && s.substr(j - 1, 6) == "\\u0000") {
+                return true;
+            }
+            i = j - 1;
+        }
+    }
+    return false;
+}
+
 
 struct EvpPkeyDeleter {
     void operator()(EVP_PKEY *p) const noexcept { if (p) EVP_PKEY_free(p); }
@@ -46,6 +71,33 @@ struct JsonValDeleter {
     void operator()(json_value_t *v) const noexcept { if (v) json_value_destroy(v); }
 };
 using UniqueJsonVal = std::unique_ptr<json_value_t, JsonValDeleter>;
+
+struct EcdsaSigDeleter {
+    void operator()(ECDSA_SIG *s) const noexcept { if (s) ECDSA_SIG_free(s); }
+};
+using UniqueEcdsaSig = std::unique_ptr<ECDSA_SIG, EcdsaSigDeleter>;
+
+struct BnDeleter {
+    void operator()(BIGNUM *b) const noexcept { if (b) BN_free(b); }
+};
+using UniqueBn = std::unique_ptr<BIGNUM, BnDeleter>;
+
+bool is_p256_ec_key(EVP_PKEY *pkey) noexcept {
+    if (!pkey || EVP_PKEY_base_id(pkey) != EVP_PKEY_EC) {
+        return false;
+    }
+    char curve_name[64] = {};
+    size_t curve_len = 0;
+    if (EVP_PKEY_get_utf8_string_param(
+            pkey, OSSL_PKEY_PARAM_GROUP_NAME, curve_name, sizeof(curve_name), &curve_len) != 1) {
+        return false;
+    }
+    if (curve_len == 0 || curve_len >= sizeof(curve_name)) {
+        return false;
+    }
+    curve_name[curve_len] = '\0';
+    return OBJ_txt2nid(curve_name) == NID_X9_62_prime256v1;
+}
 
 bool is_strict_base64url(std::string_view s) noexcept {
     if (s.empty()) return false;
@@ -146,6 +198,8 @@ const char* to_string(JwtError err) noexcept {
         case JwtError::DuplicateKey: return "duplicate_key";
         case JwtError::ClaimTypeMismatch: return "claim_type_mismatch";
         case JwtError::UnsupportedHeaderParameter: return "unsupported_header_parameter";
+        case JwtError::TypeMismatch: return "type_mismatch";
+        case JwtError::KidMismatch: return "kid_mismatch";
     }
     return "unknown_error";
 }
@@ -158,6 +212,7 @@ std::string_view to_string(JwtAlgorithm alg) noexcept {
         case JwtAlgorithm::RS256: return "RS256";
         case JwtAlgorithm::RS384: return "RS384";
         case JwtAlgorithm::RS512: return "RS512";
+        case JwtAlgorithm::ES256: return "ES256";
         case JwtAlgorithm::Ed25519: return "Ed25519";
     }
     return "unknown";
@@ -170,6 +225,7 @@ std::optional<JwtAlgorithm> parse_jwt_algorithm(std::string_view str) noexcept {
     if (str == "RS256") return JwtAlgorithm::RS256;
     if (str == "RS384") return JwtAlgorithm::RS384;
     if (str == "RS512") return JwtAlgorithm::RS512;
+    if (str == "ES256") return JwtAlgorithm::ES256;
     if (str == "Ed25519" || str == "EdDSA") return JwtAlgorithm::Ed25519;
     return std::nullopt;
 }
@@ -330,8 +386,12 @@ JwtResult<std::string> JwtSigner::sign_hmac(
     const JwtClaims &claims,
     std::string_view secret,
     JwtAlgorithm alg,
-    std::string_view kid) {
+    std::string_view kid,
+    std::string_view typ) {
 
+    if (typ.empty()) {
+        return {JwtError::MalformedToken};
+    }
     if (secret.empty()) {
         return {JwtError::KeyInvalid};
     }
@@ -350,10 +410,10 @@ JwtResult<std::string> JwtSigner::sign_hmac(
     }
 
     JsonObject header;
-    header["alg"] = std::string(to_string(alg));
-    header["typ"] = "JWT";
+    header.push_back("alg", to_string(alg));
+    header.push_back("typ", typ);
     if (!kid.empty()) {
-        header["kid"] = std::string(kid);
+        header.push_back("kid", kid);
     }
 
     std::string header_b64 = Base64::encode_url(header.dump());
@@ -376,8 +436,12 @@ JwtResult<std::string> JwtSigner::sign_pem(
     const JwtClaims &claims,
     std::string_view private_key_pem,
     JwtAlgorithm alg,
-    std::string_view kid) {
+    std::string_view kid,
+    std::string_view typ) {
 
+    if (typ.empty()) {
+        return {JwtError::MalformedToken};
+    }
     if (private_key_pem.empty()) {
         return {JwtError::KeyInvalid};
     }
@@ -391,12 +455,16 @@ JwtResult<std::string> JwtSigner::sign_pem(
     UniqueEvpPkey u_pkey(pkey);
 
     const char *md_name = nullptr;
+    bool is_ecdsa = false;
     if (alg == JwtAlgorithm::RS256) {
         md_name = "SHA256";
     } else if (alg == JwtAlgorithm::RS384) {
         md_name = "SHA384";
     } else if (alg == JwtAlgorithm::RS512) {
         md_name = "SHA512";
+    } else if (alg == JwtAlgorithm::ES256) {
+        md_name = "SHA256";
+        is_ecdsa = true;
     } else if (alg == JwtAlgorithm::Ed25519) {
         md_name = nullptr;
     } else {
@@ -404,7 +472,11 @@ JwtResult<std::string> JwtSigner::sign_pem(
     }
 
     // Verify key type & size
-    if (md_name) {
+    if (is_ecdsa) {
+        if (!is_p256_ec_key(pkey)) {
+            return {JwtError::KeyInvalid};
+        }
+    } else if (md_name) {
         if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA || EVP_PKEY_bits(pkey) < 2048) {
             return {JwtError::KeyInvalid};
         }
@@ -415,10 +487,10 @@ JwtResult<std::string> JwtSigner::sign_pem(
     }
 
     JsonObject header;
-    header["alg"] = std::string(to_string(alg));
-    header["typ"] = "JWT";
+    header.push_back("alg", to_string(alg));
+    header.push_back("typ", typ);
     if (!kid.empty()) {
-        header["kid"] = std::string(kid);
+        header.push_back("kid", kid);
     }
 
     std::string header_b64 = Base64::encode_url(header.dump());
@@ -449,6 +521,26 @@ JwtResult<std::string> JwtSigner::sign_pem(
     }
     sig_bytes.resize(sig_len);
 
+    if (is_ecdsa) {
+        const unsigned char *p = sig_bytes.data();
+        UniqueEcdsaSig ecdsa_sig(d2i_ECDSA_SIG(nullptr, &p, static_cast<long>(sig_bytes.size())));
+        if (!ecdsa_sig) {
+            return {JwtError::KeyInvalid};
+        }
+        const BIGNUM *r = nullptr;
+        const BIGNUM *s = nullptr;
+        ECDSA_SIG_get0(ecdsa_sig.get(), &r, &s);
+        if (!r || !s) {
+            return {JwtError::KeyInvalid};
+        }
+        unsigned char raw_rs[64];
+        if (BN_bn2binpad(r, raw_rs, 32) != 32 || BN_bn2binpad(s, raw_rs + 32, 32) != 32) {
+            return {JwtError::KeyInvalid};
+        }
+        std::string sig_b64 = Base64::encode_url(raw_rs, sizeof(raw_rs));
+        return {signing_input + "." + sig_b64, JwtError::None};
+    }
+
     std::string sig_b64 = Base64::encode_url(sig_bytes.data(), sig_bytes.size());
     return {signing_input + "." + sig_b64, JwtError::None};
 }
@@ -477,6 +569,16 @@ JwtValidator& JwtValidator::require_audience(std::string aud) {
 
 JwtValidator& JwtValidator::require_subject(std::string sub) {
     expected_sub_ = std::move(sub);
+    return *this;
+}
+
+JwtValidator& JwtValidator::require_type(std::string typ) {
+    expected_typ_ = std::move(typ);
+    return *this;
+}
+
+JwtValidator& JwtValidator::require_kid(std::string kid) {
+    expected_kid_ = std::move(kid);
     return *this;
 }
 
@@ -552,6 +654,9 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
     if (!header_decoded) {
         return {JwtError::InvalidBase64};
     }
+    if (contains_json_null_escape_or_byte(*header_decoded)) {
+        return {JwtError::InvalidJson};
+    }
 
     json_value_t *h_val = json_value_parse(header_decoded->c_str());
     if (!h_val) {
@@ -617,6 +722,44 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
         return {JwtError::AlgorithmNotAllowed};
     }
 
+    // Validate optional/required 'typ' header parameter
+    std::string typ;
+    const json_value_t *typ_val = json_object_find("typ", h_obj);
+    if (typ_val) {
+        if (json_value_type(typ_val) != JSON_VALUE_STRING) {
+            return {JwtError::TypeMismatch};
+        }
+        const char *typ_str = json_value_string(typ_val);
+        if (!typ_str || !*typ_str) {
+            return {JwtError::TypeMismatch};
+        }
+        typ = typ_str;
+    }
+    if (expected_typ_) {
+        if (!typ_val || typ != *expected_typ_) {
+            return {JwtError::TypeMismatch};
+        }
+    }
+
+    // Validate optional/required 'kid' header parameter
+    std::string kid;
+    const json_value_t *kid_val = json_object_find("kid", h_obj);
+    if (kid_val) {
+        if (json_value_type(kid_val) != JSON_VALUE_STRING) {
+            return {JwtError::KidMismatch};
+        }
+        const char *kid_str = json_value_string(kid_val);
+        if (!kid_str) {
+            return {JwtError::KidMismatch};
+        }
+        kid = kid_str;
+    }
+    if (expected_kid_) {
+        if (!kid_val || kid != *expected_kid_) {
+            return {JwtError::KidMismatch};
+        }
+    }
+
     // Verify signature before parsing claims payload.
     JwtError sig_err = signature_verifier(signing_input, sig_b64, alg);
     if (sig_err != JwtError::None) {
@@ -626,6 +769,9 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
     auto payload_decoded = Base64::decode_url(payload_b64);
     if (!payload_decoded) {
         return {JwtError::InvalidBase64};
+    }
+    if (contains_json_null_escape_or_byte(*payload_decoded)) {
+        return {JwtError::InvalidJson};
     }
 
     json_value_t *p_val = json_value_parse(payload_decoded->c_str());
@@ -773,7 +919,10 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
         std::move(jti),
         exp, has_exp,
         nbf, has_nbf,
-        iat, has_iat);
+        iat, has_iat,
+        alg,
+        std::move(typ),
+        std::move(kid));
 
     return {std::move(verified), JwtError::None};
 }
@@ -826,12 +975,16 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_pem(
         UniqueEvpPkey u_pkey(pkey);
 
         const char *md_name = nullptr;
+        bool is_ecdsa = false;
         if (alg == JwtAlgorithm::RS256) {
             md_name = "SHA256";
         } else if (alg == JwtAlgorithm::RS384) {
             md_name = "SHA384";
         } else if (alg == JwtAlgorithm::RS512) {
             md_name = "SHA512";
+        } else if (alg == JwtAlgorithm::ES256) {
+            md_name = "SHA256";
+            is_ecdsa = true;
         } else if (alg == JwtAlgorithm::Ed25519) {
             md_name = nullptr;
         } else {
@@ -839,7 +992,11 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_pem(
         }
 
         // Verify key family & size
-        if (md_name) {
+        if (is_ecdsa) {
+            if (!is_p256_ec_key(pkey)) {
+                return JwtError::KeyInvalid;
+            }
+        } else if (md_name) {
             if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA || EVP_PKEY_bits(pkey) < 2048) {
                 return JwtError::KeyInvalid;
             }
@@ -850,14 +1007,46 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_pem(
         }
 
         // Bounded signature length check before crypto
-        if (alg == JwtAlgorithm::Ed25519) {
+        if (alg == JwtAlgorithm::Ed25519 || is_ecdsa) {
             if (sig_b64.size() != 86) return JwtError::SignatureMismatch;
         }
 
         auto raw_sig = Base64::decode_url(sig_b64);
         if (!raw_sig) return JwtError::SignatureMismatch;
 
-        if (md_name) {
+        unsigned char der_sig[80];
+        const unsigned char *verify_sig_ptr = reinterpret_cast<const unsigned char *>(raw_sig->data());
+        size_t verify_sig_len = raw_sig->size();
+
+        if (is_ecdsa) {
+            if (raw_sig->size() != 64) return JwtError::SignatureMismatch;
+            UniqueBn r(BN_bin2bn(reinterpret_cast<const unsigned char *>(raw_sig->data()), 32, nullptr));
+            UniqueBn s(BN_bin2bn(reinterpret_cast<const unsigned char *>(raw_sig->data() + 32), 32, nullptr));
+            if (!r || !s) {
+                return JwtError::SignatureMismatch;
+            }
+
+            UniqueEcdsaSig ecdsa_sig(ECDSA_SIG_new());
+            if (!ecdsa_sig) {
+                return JwtError::KeyInvalid;
+            }
+            if (ECDSA_SIG_set0(ecdsa_sig.get(), r.get(), s.get()) != 1) {
+                return JwtError::SignatureMismatch;
+            }
+            r.release();
+            s.release();
+
+            int der_len = i2d_ECDSA_SIG(ecdsa_sig.get(), nullptr);
+            if (der_len <= 0 || static_cast<size_t>(der_len) > sizeof(der_sig)) {
+                return JwtError::SignatureMismatch;
+            }
+            unsigned char *der_ptr = der_sig;
+            if (i2d_ECDSA_SIG(ecdsa_sig.get(), &der_ptr) != der_len) {
+                return JwtError::SignatureMismatch;
+            }
+            verify_sig_ptr = der_sig;
+            verify_sig_len = static_cast<size_t>(der_len);
+        } else if (md_name) {
             int key_size = EVP_PKEY_size(pkey);
             if (key_size <= 0 || static_cast<size_t>(key_size) != raw_sig->size()) {
                 return JwtError::SignatureMismatch;
@@ -876,8 +1065,8 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_pem(
         }
 
         int ret = EVP_DigestVerify(ctx,
-                                   reinterpret_cast<const unsigned char *>(raw_sig->data()),
-                                   raw_sig->size(),
+                                   verify_sig_ptr,
+                                   verify_sig_len,
                                    reinterpret_cast<const unsigned char *>(signing_input.data()),
                                    signing_input.size());
         return ret == 1 ? JwtError::None : JwtError::SignatureMismatch;

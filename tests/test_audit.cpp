@@ -6,7 +6,7 @@
 #include "kale/http/sse.h"
 #include "kale/http/field_desc.h"
 #include "kale/http/json_reader.h"
-#include "kale/http/binding.h"
+#include "kale/http/json_writer.h"
 #include "kale/core/context.h"
 #include "http/base64.h"
 #include "security/crypto_util.h"
@@ -413,7 +413,7 @@ TEST_CASE("Nested duplicate JSON keys under Json DTO and ignored fields") {
 
     server.server().POST("/bind_raw_payload", [&](kale::Context &ctx) {
         try {
-            ctx.bind_json<RawJsonPayloadDTO>();
+            kale::bind_json<RawJsonPayloadDTO>(ctx);
             ctx.string("ok");
         } catch (const kale::JsonBindError &) {
             caught_bind_error.store(true);
@@ -423,7 +423,7 @@ TEST_CASE("Nested duplicate JSON keys under Json DTO and ignored fields") {
 
     server.server().POST("/bind_ignored_nested", [&](kale::Context &ctx) {
         try {
-            ctx.bind_json<SimpleAccountDTO>();
+            kale::bind_json<SimpleAccountDTO>(ctx);
             ctx.string("ok");
         } catch (const kale::JsonBindError &) {
             caught_bind_error.store(true);
@@ -489,13 +489,13 @@ TEST_CASE("any method registration set includes all supported standard HTTP meth
     }
 }
 
-TEST_CASE("Context::bind_json numeric overflow rejection for nonfinite/infinite numbers") {
+TEST_CASE("kale::bind_json numeric overflow rejection for nonfinite/infinite numbers") {
     AuditTestServer server;
     std::atomic<bool> business_invoked{false};
     std::atomic<int> bound_age{0};
 
     server.server().POST("/user_age", [&](kale::Context &ctx) {
-        auto dto = ctx.bind_json<AgeUserDTO>();
+        auto dto = kale::bind_json<AgeUserDTO>(ctx);
         business_invoked.store(true);
         bound_age.store(dto.age);
         ctx.string("ok_user_age");

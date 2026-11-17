@@ -119,8 +119,6 @@ public:
 
     bool is_json() const noexcept;
 
-    template <typename DTO, typename J = Json>
-    DTO bind_json() const;
     std::string_view route_name() const noexcept;
     std::string_view route_pattern() const noexcept;
     std::string_view route_tag(std::string_view key) const noexcept;

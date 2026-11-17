@@ -248,8 +248,6 @@ struct OpenApiSchema {
     std::string dump(int indent = 0) const;
 };
 
-namespace detail {
-
 template <typename T>
 NumericBound make_numeric_bound(T val, bool exclusive) {
     NumericBound b;
@@ -519,19 +517,17 @@ OpenApiSchema reflect_schema_impl(std::vector<const std::type_info*> &visited) {
     DTO dummy{};
     const auto &fields = dummy.__kale_fields();
     std::apply([&](const auto &...f) {
-        (detail::reflect_field(schema, f, visited), ...);
+        (reflect_field(schema, f, visited), ...);
     }, fields);
     visited.pop_back();
     return schema;
 }
 
-} // namespace detail
-
 template <typename DTO>
     requires HasKaleFields<DTO>
 inline OpenApiSchema reflect_schema() {
     std::vector<const std::type_info*> visited;
-    return detail::reflect_schema_impl<DTO>(visited);
+    return reflect_schema_impl<DTO>(visited);
 }
 
 struct RouteDoc {

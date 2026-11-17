@@ -35,6 +35,7 @@ enum class JwtAlgorithm {
     RS256,   // RSASSA-PKCS1-v1_5 using SHA-256 (RFC 7518 §3.3)
     RS384,   // RSASSA-PKCS1-v1_5 using SHA-384 (RFC 7518 §3.3)
     RS512,   // RSASSA-PKCS1-v1_5 using SHA-512 (RFC 7518 §3.3)
+    ES256,   // ECDSA using P-256 and SHA-256 (RFC 7518 §3.4)
     Ed25519  // EdDSA using Ed25519 curve (RFC 9864 / RFC 8037)
 };
 
@@ -61,6 +62,8 @@ enum class JwtError {
     DuplicateKey,               // Duplicate member key detected in header or claims object
     ClaimTypeMismatch,          // Claim value has wrong JSON type (e.g. non-numeric exp or non-string iss)
     UnsupportedHeaderParameter, // Unsupported critical header parameter (e.g. 'crit', 'b64', 'jku')
+    TypeMismatch,               // Header 'typ' is invalid, missing when required, or mismatched
+    KidMismatch,                // Header 'kid' is invalid, missing when required, or mismatched
 };
 
 const char* to_string(JwtError err) noexcept;
@@ -162,6 +165,10 @@ public:
     bool has_nbf() const noexcept { return has_nbf_; }
     bool has_iat() const noexcept { return has_iat_; }
 
+    JwtAlgorithm algorithm() const noexcept { return alg_; }
+    std::string_view token_type() const noexcept { return typ_; }
+    std::string_view kid() const noexcept { return kid_; }
+
     Json operator[](const std::string &key) const;
     bool has(const std::string &key) const noexcept;
     const Json& raw_payload() const noexcept { return payload_; }
@@ -179,7 +186,10 @@ private:
                       std::string jti,
                       int64_t exp, bool has_exp,
                       int64_t nbf, bool has_nbf,
-                      int64_t iat, bool has_iat)
+                      int64_t iat, bool has_iat,
+                      JwtAlgorithm alg,
+                      std::string typ,
+                      std::string kid)
         : payload_(std::move(payload)),
           iss_(std::move(iss)),
           sub_(std::move(sub)),
@@ -187,7 +197,10 @@ private:
           jti_(std::move(jti)),
           exp_(exp), has_exp_(has_exp),
           nbf_(nbf), has_nbf_(has_nbf),
-          iat_(iat), has_iat_(has_iat) {}
+          iat_(iat), has_iat_(has_iat),
+          alg_(alg),
+          typ_(std::move(typ)),
+          kid_(std::move(kid)) {}
 
     Json payload_;
     std::string iss_;
@@ -200,6 +213,9 @@ private:
     bool has_nbf_{false};
     int64_t iat_{0};
     bool has_iat_{false};
+    JwtAlgorithm alg_{JwtAlgorithm::HS256};
+    std::string typ_;
+    std::string kid_;
 };
 
 /**
@@ -212,14 +228,16 @@ public:
         const JwtClaims &claims,
         std::string_view secret,
         JwtAlgorithm alg = JwtAlgorithm::HS256,
-        std::string_view kid = "");
+        std::string_view kid = "",
+        std::string_view typ = "JWT");
 
-    // Signs token using PEM Private Key (RS256, RS384, RS512, Ed25519)
+    // Signs token using PEM Private Key (RS256, RS384, RS512, ES256, Ed25519)
     static JwtResult<std::string> sign_pem(
         const JwtClaims &claims,
         std::string_view private_key_pem,
         JwtAlgorithm alg = JwtAlgorithm::RS256,
-        std::string_view kid = "");
+        std::string_view kid = "",
+        std::string_view typ = "JWT");
 };
 
 /**
@@ -237,6 +255,8 @@ public:
     JwtValidator& require_issuer(std::string iss);
     JwtValidator& require_audience(std::string aud);
     JwtValidator& require_subject(std::string sub);
+    JwtValidator& require_type(std::string typ);
+    JwtValidator& require_kid(std::string kid);
 
     // Clock tolerance and claim verification toggles
     JwtValidator& set_clock_skew(std::chrono::seconds skew); // Default: 60s
@@ -251,7 +271,7 @@ public:
         std::string_view token,
         std::string_view secret) const;
 
-    // Verifies asymmetric token (RS256, RS384, RS512, Ed25519)
+    // Verifies asymmetric token (RS256, RS384, RS512, ES256, Ed25519)
     JwtResult<VerifiedJwtClaims> verify_pem(
         std::string_view token,
         std::string_view public_key_pem) const;
@@ -265,6 +285,8 @@ private:
     std::optional<std::string> expected_iss_;
     std::optional<std::string> expected_aud_;
     std::optional<std::string> expected_sub_;
+    std::optional<std::string> expected_typ_;
+    std::optional<std::string> expected_kid_;
     std::chrono::seconds clock_skew_{60};
     bool check_exp_{true};
     bool require_exp_{true};

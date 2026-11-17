@@ -23,11 +23,9 @@
 
 #include "coke/sleep.h"
 #include "coke/task.h"
-#include "coke/wait.h"
 #include "kale/core/context.h"
 #include "kale/core/http_server.h"
-#include "kale/core/router.h"
-#include "kale/core/http_status.h"
+#include "kale/core/http_util.h"
 #include "kale/http/form.h"
 #include "kale/http/multipart.h"
 #include "kale/http/sse.h"
@@ -791,6 +789,45 @@ TEST_CASE("Direct scalar Context::form and has_form multipart media-type case in
         auto res = server.post("/test_case_insensitive_multipart", mp_body, "MULTIPART/FORM-DATA; boundary=caseboundary");
         CHECK_EQ(res.status, 200);
         CHECK_EQ(res.body, "ok_case_insensitive");
+    }
+}
+
+TEST_CASE("url_encode RFC 3986 encoding and decode round-trip") {
+    CHECK_EQ(kale::url_encode(""), "");
+
+    const std::string_view unreserved =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    CHECK_EQ(kale::url_encode(unreserved), unreserved);
+
+    CHECK_EQ(kale::url_encode(" "), "%20");
+    CHECK_EQ(kale::url_encode("hello world"), "hello%20world");
+    CHECK_EQ(kale::url_encode("+"), "%2B");
+    CHECK_EQ(kale::url_encode("a+b"), "a%2Bb");
+    CHECK_EQ(kale::url_encode("/"), "%2F");
+    CHECK_EQ(kale::url_encode("a/b/c"), "a%2Fb%2Fc");
+    CHECK_EQ(kale::url_encode("%"), "%25");
+    CHECK_EQ(kale::url_encode("100%"), "100%25");
+    CHECK_EQ(kale::url_encode("?&=#:"), "%3F%26%3D%23%3A");
+
+    const std::string_view ctrl("\x00\x1f\x7f", 3);
+    CHECK_EQ(kale::url_encode(ctrl), "%00%1F%7F");
+
+    const std::string_view utf8 = "héllo 世界";
+    CHECK_EQ(kale::url_encode(utf8), "h%C3%A9llo%20%E4%B8%96%E7%95%8C");
+
+    const std::vector<std::string> samples = {
+        "",
+        std::string(unreserved),
+        "hello world",
+        "a+b=c&d/e?f#g%h",
+        "100% + 50% / 2",
+        std::string(utf8),
+        std::string(ctrl),
+    };
+    for (const auto &sample : samples) {
+        const std::string encoded = kale::url_encode(sample);
+        CHECK_EQ(kale::url_decode(encoded), sample);
+        CHECK_EQ(kale::path_percent_decode(encoded), sample);
     }
 }
 

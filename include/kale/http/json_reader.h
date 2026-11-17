@@ -20,8 +20,14 @@
 
 #include <kale/http/field_desc.h>
 #include <kale/core/http_error.h>
+#include <kale/core/context.h>
 
 namespace kale {
+
+// Forward declaration of the built-in JSON DOM so that bind_json<DTO> can default J to
+// kale::Json without this header pulling in <kale/http/json.h>. Callers that do not
+// include json.h must spell the JSON type explicitly: bind_json<DTO, J>.
+class Json;
 
 /**
  * @brief Exception thrown on JSON binding failure with field path, expected type, and reason.
@@ -786,8 +792,8 @@ void bind_dto_fields(const JsonReader<J> &reader,
     }
 }
 
-template <typename DTO, typename J>
-DTO bind_json_body(std::string_view body) {
+template <typename DTO, typename J = Json>
+DTO bind_json(std::string_view body) {
     static_assert(!is_string_view_v<DTO>,
                   "DTO type cannot be std::string_view; parsed JSON does not outlive bind_json()");
     static_assert(!std::is_pointer_v<DTO>,
@@ -805,6 +811,11 @@ DTO bind_json_body(std::string_view body) {
     DTO dto{};
     bind_dto_fields<DTO, J>(reader, root, "", dto);
     return dto;
+}
+
+template <typename DTO, typename J = Json>
+inline DTO bind_json(const Context &ctx) {
+    return bind_json<DTO, J>(ctx.req_body());
 }
 
 

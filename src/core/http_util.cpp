@@ -66,6 +66,35 @@ bool is_valid_reason_phrase(std::string_view phrase) noexcept {
     return true;
 }
 
+std::string url_encode(std::string_view str) {
+    static constexpr char hex_chars[] = "0123456789ABCDEF";
+    std::string encoded;
+    size_t out_len = 0;
+    for (unsigned char c : str) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '.' || c == '_' || c == '~') {
+            out_len += 1;
+        } else {
+            out_len += 3;
+        }
+    }
+    encoded.reserve(out_len);
+
+    for (unsigned char c : str) {
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '.' || c == '_' || c == '~') {
+            encoded.push_back(static_cast<char>(c));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(hex_chars[(c >> 4) & 0x0F]);
+            encoded.push_back(hex_chars[c & 0x0F]);
+        }
+    }
+    return encoded;
+}
+
 std::string url_decode(std::string_view str) {
     std::string decoded;
     decoded.reserve(str.size());

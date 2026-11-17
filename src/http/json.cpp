@@ -1051,6 +1051,7 @@ void Json::string_convert(const char *str, std::string *out) {
 }
 
 void Json::number_convert(double number, std::string *out) {
+    if (!std::isfinite(number)) throw std::invalid_argument("JSON number must be finite");
     char buffer[64];
     auto result = std::to_chars(buffer, buffer + sizeof(buffer), number,
                                 std::chars_format::general, std::numeric_limits<double>::max_digits10);

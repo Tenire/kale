@@ -32,8 +32,9 @@
 #include <nlohmann/json.hpp>
 
 #include "kale/http/field_desc.h"
+#include "kale/http/json.h"
 #include "kale/http/json_reader.h"
-#include "kale/http/binding.h"
+#include "kale/http/json_writer.h"
 #include "kale/http/validator.h"
 #include "kale/core/context.h"
 #include "kale/core/http_server.h"
@@ -443,7 +444,7 @@ TEST_CASE("Validation: Generic DTO binding across kale::Json and nlohmann::json"
 
         UserValidationDTO dto;
         {
-            dto = kale::bind_json_body<UserValidationDTO, J>(valid_body);
+            dto = kale::bind_json<UserValidationDTO, J>(valid_body);
         }
 
         // Verify owning DTO fields outlive JSON parser
@@ -471,7 +472,7 @@ TEST_CASE("Validation: Generic DTO binding across kale::Json and nlohmann::json"
             "tags": ["core"]
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(invalid_name);
+            kale::bind_json<UserValidationDTO, J>(invalid_name);
             FAIL("expected JsonBindError for short name");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "name");
@@ -489,7 +490,7 @@ TEST_CASE("Validation: Generic DTO binding across kale::Json and nlohmann::json"
             "tags": ["core"]
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(invalid_age);
+            kale::bind_json<UserValidationDTO, J>(invalid_age);
             FAIL("expected JsonBindError for age < 18");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "age");
@@ -507,7 +508,7 @@ TEST_CASE("Validation: Generic DTO binding across kale::Json and nlohmann::json"
             "tags": ["core"]
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(invalid_role);
+            kale::bind_json<UserValidationDTO, J>(invalid_role);
             FAIL("expected JsonBindError for invalid role");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "role");
@@ -525,7 +526,7 @@ TEST_CASE("Validation: Generic DTO binding across kale::Json and nlohmann::json"
             "tags": ["core"]
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(invalid_code);
+            kale::bind_json<UserValidationDTO, J>(invalid_code);
             FAIL("expected JsonBindError for regex mismatch");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "code");
@@ -543,7 +544,7 @@ TEST_CASE("Validation: Generic DTO binding across kale::Json and nlohmann::json"
             "tags": []
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(empty_tags);
+            kale::bind_json<UserValidationDTO, J>(empty_tags);
             FAIL("expected JsonBindError for empty tags vector");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "tags");
@@ -571,7 +572,7 @@ TEST_CASE("Validation: Optional fields absent/null skip vs explicit required()")
             "token": "valid_token_123",
             "tags": ["sales"]
         })";
-        auto dto1 = kale::bind_json_body<UserValidationDTO, J>(missing_bio);
+        auto dto1 = kale::bind_json<UserValidationDTO, J>(missing_bio);
         CHECK_FALSE(dto1.bio.has_value());
 
         std::string null_bio = R"({
@@ -584,7 +585,7 @@ TEST_CASE("Validation: Optional fields absent/null skip vs explicit required()")
             "token": "valid_token_123",
             "tags": ["sales"]
         })";
-        auto dto2 = kale::bind_json_body<UserValidationDTO, J>(null_bio);
+        auto dto2 = kale::bind_json<UserValidationDTO, J>(null_bio);
         CHECK_FALSE(dto2.bio.has_value());
 
         // Case 2: token is optional WITH required() -> missing throws JsonBindError
@@ -597,7 +598,7 @@ TEST_CASE("Validation: Optional fields absent/null skip vs explicit required()")
             "tags": ["sales"]
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(missing_token);
+            kale::bind_json<UserValidationDTO, J>(missing_token);
             FAIL("expected missing required token error");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "token");
@@ -615,7 +616,7 @@ TEST_CASE("Validation: Optional fields absent/null skip vs explicit required()")
             "tags": ["sales"]
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(null_token);
+            kale::bind_json<UserValidationDTO, J>(null_token);
             FAIL("expected null required token error");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "token");
@@ -633,7 +634,7 @@ TEST_CASE("Validation: Optional fields absent/null skip vs explicit required()")
             "tags": ["sales"]
         })";
         try {
-            kale::bind_json_body<UserValidationDTO, J>(short_token);
+            kale::bind_json<UserValidationDTO, J>(short_token);
             FAIL("expected short token error");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "token");
@@ -660,7 +661,7 @@ TEST_CASE("Validation: Accurate JSON paths for nested DTOs and vectors") {
                 {"title": "Item B", "code": 200}
             ]
         })";
-        auto order = kale::bind_json_body<OrderDTO, J>(valid_order);
+        auto order = kale::bind_json<OrderDTO, J>(valid_order);
         CHECK_EQ(order.order_id, "ORD-1001");
         CHECK_EQ(order.primary.title, "Main Widget");
         CHECK_EQ(order.primary.code, 150);
@@ -675,7 +676,7 @@ TEST_CASE("Validation: Accurate JSON paths for nested DTOs and vectors") {
             ]
         })";
         try {
-            kale::bind_json_body<OrderDTO, J>(invalid_primary);
+            kale::bind_json<OrderDTO, J>(invalid_primary);
             FAIL("expected primary.code error");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "primary.code");
@@ -692,7 +693,7 @@ TEST_CASE("Validation: Accurate JSON paths for nested DTOs and vectors") {
             ]
         })";
         try {
-            kale::bind_json_body<OrderDTO, J>(invalid_item_elem);
+            kale::bind_json<OrderDTO, J>(invalid_item_elem);
             FAIL("expected items[1].title error");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "items[1].title");
@@ -706,7 +707,7 @@ TEST_CASE("Validation: Accurate JSON paths for nested DTOs and vectors") {
             "items": []
         })";
         try {
-            kale::bind_json_body<OrderDTO, J>(empty_items);
+            kale::bind_json<OrderDTO, J>(empty_items);
             FAIL("expected items min_len error");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "items");
@@ -729,7 +730,7 @@ TEST_CASE("Validation: 64-bit integer binding and comparison across libraries") 
             "id": 9007199254740990,
             "counter": 9007199254740991
         })";
-        auto dto = kale::bind_json_body<Exact53BitIntDTO, kale::Json>(valid_double_json);
+        auto dto = kale::bind_json<Exact53BitIntDTO, kale::Json>(valid_double_json);
         CHECK_EQ(dto.id, 9007199254740990LL);
         CHECK_EQ(dto.counter, 9007199254740991ULL);
 
@@ -738,7 +739,7 @@ TEST_CASE("Validation: 64-bit integer binding and comparison across libraries") 
             "counter": 9007199254740991
         })";
         try {
-            kale::bind_json_body<Exact53BitIntDTO, kale::Json>(overflow_id);
+            kale::bind_json<Exact53BitIntDTO, kale::Json>(overflow_id);
             FAIL("expected id range failure for kale::Json");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "id");
@@ -752,7 +753,7 @@ TEST_CASE("Validation: 64-bit integer binding and comparison across libraries") 
             "counter": 10000000000000001
         })";
         try {
-            kale::bind_json_body<HighPrecisionIntDTO, kale::Json>(beyond_double);
+            kale::bind_json<HighPrecisionIntDTO, kale::Json>(beyond_double);
             FAIL("expected counter gt failure due to double mantissa rounding");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "counter");
@@ -765,7 +766,7 @@ TEST_CASE("Validation: 64-bit integer binding and comparison across libraries") 
             "id": 9007199254740993,
             "counter": 10000000000000001
         })";
-        auto dto = kale::bind_json_body<HighPrecisionIntDTO, nlohmann::json>(valid_hp);
+        auto dto = kale::bind_json<HighPrecisionIntDTO, nlohmann::json>(valid_hp);
         CHECK_EQ(dto.id, 9007199254740993LL);
         CHECK_EQ(dto.counter, 10000000000000001ULL);
 
@@ -774,7 +775,7 @@ TEST_CASE("Validation: 64-bit integer binding and comparison across libraries") 
             "counter": 10000000000000001
         })";
         try {
-            kale::bind_json_body<HighPrecisionIntDTO, nlohmann::json>(overflow_id);
+            kale::bind_json<HighPrecisionIntDTO, nlohmann::json>(overflow_id);
             FAIL("expected id range failure for nlohmann::json");
         } catch (const kale::JsonBindError &e) {
             CHECK_EQ(e.field(), "id");
@@ -791,7 +792,7 @@ TEST_CASE("Validation: Real HTTP endpoints with service invocation count trackin
 
     // Route 1: Using kale::Json reader
     fixture->POST("/api/v1/users/kale", [&](kale::Context &ctx) {
-        auto dto = ctx.bind_json<UserValidationDTO, kale::Json>();
+        auto dto = kale::bind_json<UserValidationDTO, kale::Json>(ctx);
         kale_service_invocations.fetch_add(1, std::memory_order_relaxed);
         ctx.json(kale::Json::Object{
             {"status", "created"},
@@ -801,7 +802,7 @@ TEST_CASE("Validation: Real HTTP endpoints with service invocation count trackin
 
     // Route 2: Using nlohmann::json reader
     fixture->POST("/api/v1/users/nloh", [&](kale::Context &ctx) {
-        auto dto = ctx.bind_json<UserValidationDTO, nlohmann::json>();
+        auto dto = kale::bind_json<UserValidationDTO, nlohmann::json>(ctx);
         nloh_service_invocations.fetch_add(1, std::memory_order_relaxed);
         ctx.json(kale::Json::Object{
             {"status", "created"},
@@ -891,7 +892,7 @@ TEST_CASE("Validation: PatternRule thread safety and static descriptor reuse") {
     std::atomic<int> completed_requests{0};
 
     fixture->POST("/api/v1/fast_validate", [&](kale::Context &ctx) {
-        auto dto = ctx.bind_json<UserValidationDTO, kale::Json>();
+        auto dto = kale::bind_json<UserValidationDTO, kale::Json>(ctx);
         completed_requests.fetch_add(1, std::memory_order_relaxed);
         ctx.json(kale::Json::Object{{"code", dto.code}});
     });

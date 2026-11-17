@@ -119,7 +119,7 @@ Eight umbrella headers aggregate public interfaces across functional domains:
 1. **`<kale/core.h>`**: Core server, context, router, cookies, methods, errors, logger, codecs, and status codes (`checksum.h`, `compress.h`, `context.h`, `cookie.h`, `crc32_checksum.h`, `error_response.h`, `http_error.h`, `http_method.h`, `http_server.h`, `http_status.h`, `http_util.h`, `logger.h`, `router.h`). Note: Does not include `blueprint.h`.
 2. **`<kale/routing.h>`**: Modular routing and composition (`blueprint.h`, `router.h`).
 3. **`<kale/http.h>`**: HTTP payloads, caching, forms, multipart uploads, SSE, and health endpoints (`file_cache.h`, `file_response.h`, `form.h`, `health.h`, `json.h`, `multipart.h`, `resumable_upload.h`, `sse.h`, `static_files.h`, `upload.h`).
-4. **`<kale/api.h>`**: DTO binding, validation, and OpenAPI 3.0 generation (`binding.h`, `field_desc.h`, `json_reader.h`, `openapi.h`, `validator.h`).
+4. **`<kale/api.h>`**: DTO binding, validation, and OpenAPI 3.0 generation (`field_desc.h`, `json_reader.h`, `json_writer.h`, `openapi.h`, `validator.h`).
 5. **`<kale/stream.h>`**: Streaming context, file response, and Server-Sent Events (`context.h`, `file_response.h`, `sse.h`).
 6. **`<kale/middlewares.h>`**: Built-in HTTP middlewares (`access_log.h`, `compression.h`, `cors.h`, `error_handler.h`, `prometheus.h`, `rate_limiter.h`, `request_id.h`, `security_headers.h`).
 7. **`<kale/security.h>`**: Authentication, JWT tokens, sessions, CSRF protection, and cryptographic checksums (`csrf.h`, `evp_checksum.h`, `jwt.h`, `session.h`, `signed_cookie.h`).
@@ -130,7 +130,7 @@ There are no `kale.h` or `compress.h` umbrella headers; non-aggregated component
 #### Precise Headers Reference
 For minimal compile boundaries and fine-grained dependencies, include exact headers directly:
 - Core server and routing: `#include "kale/core/http_server.h"`, `#include "kale/core/router.h"`, `#include "kale/core/blueprint.h"`, `#include "kale/core/context.h"`, `#include "kale/core/http_status.h"`, `#include "kale/core/logger.h"`
-- HTTP, JSON & files: `#include "kale/http/json.h"`, `#include "kale/http/binding.h"`, `#include "kale/http/file_cache.h"`, `#include "kale/http/multipart.h"`, `#include "kale/http/sse.h"`
+- HTTP, JSON & files: `#include "kale/http/json.h"`, `#include "kale/http/json_reader.h"`, `#include "kale/http/json_writer.h"`, `#include "kale/http/file_cache.h"`, `#include "kale/http/multipart.h"`, `#include "kale/http/sse.h"`
 - Middlewares: `#include "kale/middleware/access_log.h"`, `#include "kale/middleware/compression.h"`, `#include "kale/middleware/cors.h"`, `#include "kale/middleware/error_handler.h"`, `#include "kale/middleware/prometheus.h"`, `#include "kale/middleware/rate_limiter.h"`, `#include "kale/middleware/request_id.h"`, `#include "kale/middleware/security_headers.h"`
 - Security & authentication: `#include "kale/security/session.h"`, `#include "kale/security/jwt.h"`, `#include "kale/security/csrf.h"`
 - Client & proxy: `#include "kale/client/http_client.h"`, `#include "kale/client/reverse_proxy.h"`

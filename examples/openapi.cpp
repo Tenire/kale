@@ -6,7 +6,7 @@
 #include "kale/core/context.h"
 #include "kale/core/http_server.h"
 #include "kale/core/http_status.h"
-#include "kale/http/binding.h"
+#include "kale/http/json_reader.h"
 #include "kale/http/field_desc.h"
 #include "kale/http/json.h"
 #include "kale/http/openapi.h"
@@ -152,7 +152,7 @@ int main(int argc, char *argv[]) {
         server.POST("/api/users", [](kale::Context &ctx) {
             UserCreateDTO dto;
             try {
-                dto = ctx.bind_json<UserCreateDTO>();
+                dto = kale::bind_json<UserCreateDTO>(ctx);
             } catch (const kale::JsonBindError &err) {
                 ctx.set_status(kale::HttpStatus::BadRequest);
                 ctx.json(kale::Json::Object{
