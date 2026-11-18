@@ -372,6 +372,7 @@ void reply_error_impl(Context &ctx,
     ScopedConfigGuard guard(ctx, &formatter, &policy);
 
     ErrorContext err_ctx;
+    err_ctx.request_id = get_request_id(ctx);
     const HttpError *caught_http = err;
     const std::exception *caught_std = nullptr;
 
@@ -417,7 +418,7 @@ void reply_error_impl(Context &ctx,
     }
 
     if (err_ctx.status_code >= 500 && policy.logger.enabled(LogLevel::Error)) {
-        LogContext log_ctx{"http_server", ctx.method_string(), ctx.path(), err_ctx.status_code};
+        LogContext log_ctx{"http_server", ctx.method_string(), ctx.path(), err_ctx.status_code, err_ctx.request_id};
         policy.logger.log(LogLevel::Error, log_ctx, unredacted_message);
     }
 

@@ -49,6 +49,12 @@ void Logger::log(LogLevel level, const LogContext &ctx, std::string_view message
         if (written > 0) offset += static_cast<size_t>(written);
     }
 
+    if (!ctx.request_id.empty() && offset + 3 + ctx.request_id.size() < sizeof(buf)) {
+        written = snprintf(buf + offset, sizeof(buf) - offset, " [%.*s]",
+                           static_cast<int>(ctx.request_id.size()), ctx.request_id.data());
+        if (written > 0) offset += static_cast<size_t>(written);
+    }
+
     if ((!ctx.method.empty() || !ctx.path.empty() || ctx.status_code != 0) && offset + 16 < sizeof(buf)) {
         if (ctx.status_code != 0) {
             written = snprintf(buf + offset, sizeof(buf) - offset, " [%.*s %.*s %d]",

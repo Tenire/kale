@@ -862,6 +862,11 @@ coke::NetworkReplyAwaiter Context::reply() {
     assert(!replied_);
     replied_ = true;
     sync_status_to_raw();
+    const int status = status_code_;
+    const bool body_allowed = (status != 204 && status != 304 && (status < 100 || status >= 200));
+    if (body_allowed && !has_resp_header("Content-Length") && !has_resp_header("Transfer-Encoding")) {
+        set_header("Content-Length", std::to_string(resp_body_size()));
+    }
     return ctx_.reply();
 }
 

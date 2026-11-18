@@ -22,6 +22,7 @@ struct ErrorContext {
     const HttpError::HeaderList *headers{nullptr};
     const std::exception *raw_exception{nullptr};
     std::exception_ptr exception{};
+    std::string_view request_id{};
 };
 
 using ErrorFormatter = std::function<void(Context &ctx, const ErrorContext &err_ctx)>;

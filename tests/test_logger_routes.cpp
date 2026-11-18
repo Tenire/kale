@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unistd.h>
 
 #include "kale/core/http_server.h"
 #include "kale/core/logger.h"
@@ -58,7 +59,7 @@ TEST_CASE("Logger level filtering, sinks, and exception safety") {
         CHECK(entries.empty());
 
         // Info with LogContext recorded
-        kale::LogContext ctx{"http_server", "POST", "/api/items", 201};
+        kale::LogContext ctx{"http_server", "POST", "/api/items", 201, "req-123"};
         logger.log(kale::LogLevel::Info, ctx, "created item");
         REQUIRE(entries.size() == 1);
         CHECK(entries[0].level == kale::LogLevel::Info);
@@ -67,6 +68,29 @@ TEST_CASE("Logger level filtering, sinks, and exception safety") {
         CHECK(entries[0].path == "/api/items");
         CHECK(entries[0].status_code == 201);
         CHECK(entries[0].message == "created item");
+    }
+
+    SUBCASE("Default stderr output formats [request_id] when non-empty") {
+        int pipefd[2];
+        REQUIRE(pipe(pipefd) == 0);
+        int saved_stderr = dup(STDERR_FILENO);
+        REQUIRE(saved_stderr >= 0);
+        REQUIRE(dup2(pipefd[1], STDERR_FILENO) >= 0);
+        close(pipefd[1]);
+
+        kale::Logger logger(kale::LogLevel::Info);
+        logger.log(kale::LogLevel::Info, kale::LogContext{"http_server", "GET", "/ping", 200, "req-abc"}, "ok");
+
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+
+        char buf[512];
+        ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
+        close(pipefd[0]);
+        REQUIRE(n > 0);
+        buf[n] = '\0';
+        std::string out(buf);
+        CHECK(out.find("[http_server] [req-abc] [GET /ping 200] ok") != std::string::npos);
     }
 
     SUBCASE("Sink throwing exception is isolated safely") {

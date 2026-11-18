@@ -284,6 +284,15 @@ private:
     const ErrorPolicy *error_policy_{nullptr};
 };
 
+struct RequestId {
+    std::string value;
+};
+
+inline std::string_view get_request_id(const Context &ctx) noexcept {
+    const auto *id = ctx.get_attachment<RequestId>();
+    return id ? std::string_view(id->value) : std::string_view{};
+}
+
 } // namespace kale
 
 #endif // KALE_CORE_CONTEXT_H

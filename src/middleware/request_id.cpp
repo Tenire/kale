@@ -83,7 +83,9 @@ Middleware request_id(RequestIdConfig config) {
             if (!valid_id(selected, config.max_length)) throw std::invalid_argument("invalid generated request ID");
         }
         ctx.set_attachment(RequestId{std::move(selected)});
-        ctx.set_header(config.header_name, get_request_id(ctx));
+        if (config.set_response_header) {
+            ctx.set_header(config.header_name, get_request_id(ctx));
+        }
         co_await next();
     };
 }

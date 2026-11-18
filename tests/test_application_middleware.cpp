@@ -527,6 +527,25 @@ TEST_CASE("request ID rejects unsafe config and invalid generator results before
     CHECK_EQ(throwing.request("/id").status, 503);
 }
 
+TEST_CASE("request_id set_response_header=false keeps attachment while suppressing response header") {
+    MiddlewareServer server;
+    kale::RequestIdConfig cfg;
+    cfg.generator = [] { return std::string("internal-only-id"); };
+    cfg.set_response_header = false;
+    server->use(kale::request_id(cfg));
+    std::string seen_in_handler;
+    server->GET("/quiet", [&seen_in_handler](kale::Context &ctx) {
+        seen_in_handler = std::string(kale::get_request_id(ctx));
+        ctx.string("ok");
+    });
+    server.start();
+
+    auto res = server.request("/quiet");
+    CHECK_EQ(res.status, 200);
+    CHECK_EQ(seen_in_handler, "internal-only-id");
+    CHECK_FALSE(res.has("X-Request-Id"));
+}
+
 TEST_CASE("access log receives owning route target status duration and selected typed request ID") {
     LogStore logs;
     MiddlewareServer server;

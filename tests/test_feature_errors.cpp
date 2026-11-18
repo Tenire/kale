@@ -17,6 +17,7 @@
 #include "kale/http/json_reader.h"
 #include "kale/http/validator.h"
 #include "kale/middleware/error_handler.h"
+#include "kale/middleware/request_id.h"
 #include "workflow/HttpUtil.h"
 #include "workflow/WFTaskFactory.h"
 
@@ -275,4 +276,34 @@ TEST_CASE("Custom throwing formatter boundary safely produces 500 fallback") {
     auto res = server.request("/trigger-error");
     CHECK(res.status == 500);
     CHECK(res.body.find("Internal Server Error") != std::string::npos);
+}
+
+TEST_CASE("ErrorContext and LogContext auto-populate request_id in reply_error") {
+    std::string captured_err_req_id;
+    std::string captured_log_req_id;
+
+    kale::HttpServerParams params;
+    params.set_error_formatter([&](kale::Context &ctx, const kale::ErrorContext &err_ctx) {
+        captured_err_req_id = std::string(err_ctx.request_id);
+        kale::default_plain_text_formatter()(ctx, err_ctx);
+    });
+    kale::ErrorPolicy policy;
+    policy.logger = kale::Logger(kale::LogLevel::Error, [&](kale::LogLevel, const kale::LogContext &log_ctx, std::string_view) {
+        captured_log_req_id = std::string(log_ctx.request_id);
+    });
+    params.set_error_policy(policy);
+
+    FeatureErrorServer server(params);
+    kale::RequestIdConfig id_cfg;
+    id_cfg.generator = [] { return std::string("err-req-999"); };
+    server->use(kale::request_id(id_cfg));
+    server->GET("/boom", [](kale::Context &) {
+        throw std::runtime_error("unexpected failure");
+    });
+    server.start();
+
+    auto res = server.request("/boom");
+    CHECK(res.status == 500);
+    CHECK(captured_err_req_id == "err-req-999");
+    CHECK(captured_log_req_id == "err-req-999");
 }

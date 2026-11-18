@@ -34,6 +34,7 @@ struct LogContext {
     std::string_view method;
     std::string_view path;
     int status_code{0};
+    std::string_view request_id{};
 };
 
 class Logger {

@@ -29,6 +29,8 @@
 #include "kale/http/sse.h"
 #include "kale/security/signed_cookie.h"
 #include "kale/http/file_response.h"
+#include "kale/http/static_files.h"
+#include "kale/http/file_cache.h"
 #include "kale/http/form.h"
 #include "kale/http/upload.h"
 #include "kale/core/http_status.h"
@@ -2972,6 +2974,113 @@ TEST_CASE("Compression replaces native output body and preserves skipped/failed 
     std::string decompressed_wire;
     REQUIRE(kale::Compress::ungzip(raw_gz.body, decompressed_wire, original_data.size()));
     CHECK_EQ(decompressed_wire, original_data);
+}
+
+TEST_CASE("Compression + static_files FileCache hit preserves Content-Length on HTTP/1.1 keep-alive") {
+    namespace fs = std::filesystem;
+    const fs::path tmp_dir = fs::temp_directory_path() /
+        ("kale_007_keepalive_test_" + std::to_string(::getpid()));
+    struct DirGuard {
+        fs::path path;
+        ~DirGuard() {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        }
+    } dir_guard{tmp_dir};
+
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
+    fs::create_directories(tmp_dir);
+    const std::string payload(2048, 'K');
+    {
+        std::ofstream ofs(tmp_dir / "cached.txt", std::ios::binary);
+        ofs.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+
+    CoreTestServer srv;
+    kale::CompressConfig ccfg;
+    ccfg.min_length = 64;
+    srv.server().use(kale::compression(ccfg));
+    kale::StaticFilesConfig sfc;
+    sfc.root_dir = tmp_dir.string();
+    sfc.url_prefix.clear();
+    sfc.enable_cache = true;
+    sfc.cache_config.max_file_size = 64 * 1024;
+    srv->GET("/cached.txt", kale::static_files(sfc));
+
+    // Prime FileCache with first request, then test two keep-alive requests on one socket.
+    auto prime = srv.get("/cached.txt", {{"Accept-Encoding", "gzip"}});
+    CHECK_EQ(prime.status, 200);
+
+    struct SockGuard {
+        int fd{-1};
+        ~SockGuard() {
+            if (fd >= 0) {
+                ::close(fd);
+            }
+        }
+    } sock{::socket(AF_INET, SOCK_STREAM, 0)};
+    REQUIRE(sock.fd >= 0);
+    timeval tv{2, 0};
+    ::setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(srv.port());
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    REQUIRE(::connect(sock.fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+
+    auto read_one_http_response = [&](int s) -> std::tuple<std::string, std::string, size_t> {
+        std::string buf;
+        char tmp[4096];
+        size_t hdr_end = std::string::npos;
+        while ((hdr_end = buf.find("\r\n\r\n")) == std::string::npos) {
+            ssize_t n = ::recv(s, tmp, sizeof(tmp), 0);
+            if (n <= 0) break;
+            buf.append(tmp, static_cast<size_t>(n));
+        }
+        REQUIRE(hdr_end != std::string::npos);
+        std::string hdrs = buf.substr(0, hdr_end + 4);
+        std::string body = buf.substr(hdr_end + 4);
+        auto cl_pos = hdrs.find("Content-Length: ");
+        REQUIRE(cl_pos != std::string::npos);
+        size_t cl_val = std::stoull(hdrs.substr(cl_pos + 16));
+        while (body.size() < cl_val) {
+            ssize_t n = ::recv(s, tmp, sizeof(tmp), 0);
+            if (n <= 0) break;
+            body.append(tmp, static_cast<size_t>(n));
+        }
+        REQUIRE(body.size() >= cl_val);
+        return {hdrs, body.substr(0, cl_val), cl_val};
+    };
+
+    const std::string req1 =
+        "GET /cached.txt HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Accept-Encoding: gzip\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    REQUIRE(::send(sock.fd, req1.data(), req1.size(), 0) == static_cast<ssize_t>(req1.size()));
+    auto [h1, b1, cl1] = read_one_http_response(sock.fd);
+    CHECK(h1.find("200 OK") != std::string::npos);
+    CHECK_EQ(b1.size(), cl1);
+    CHECK(h1.find("Content-Encoding: gzip") != std::string::npos);
+    std::string dec1;
+    REQUIRE(kale::Compress::ungzip(b1, dec1, payload.size()));
+    CHECK_EQ(dec1, payload);
+
+    const std::string req2 =
+        "GET /cached.txt HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Accept-Encoding: gzip\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE(::send(sock.fd, req2.data(), req2.size(), 0) == static_cast<ssize_t>(req2.size()));
+    auto [h2, b2, cl2] = read_one_http_response(sock.fd);
+    CHECK(h2.find("200 OK") != std::string::npos);
+    CHECK_EQ(b2.size(), cl2);
+    CHECK(h2.find("Content-Encoding: gzip") != std::string::npos);
+    std::string dec2;
+    REQUIRE(kale::Compress::ungzip(b2, dec2, payload.size()));
+    CHECK_EQ(dec2, payload);
 }
 TEST_CASE("Lifecycle and exception handling before and after stream commit") {
     CoreTestServer srv;

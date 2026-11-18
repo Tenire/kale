@@ -145,6 +145,7 @@ bool compress_response(Context &ctx, const CompressConfig &config) {
         throw std::bad_alloc();
     }
     ctx.erase_resp_header("Content-Length");
+    ctx.set_header("Content-Length", std::to_string(compressed.size()));
     ctx.set_header("Content-Encoding", std::string(encoding_to_string(encoding)));
     const auto vary = ctx.resp_header("Vary");
     if (vary.empty()) {
