@@ -384,4 +384,137 @@ TEST_CASE("CSRF HTTP Server E2E Lifecycle") {
     }
 }
 
+TEST_CASE("CSRF OriginOnly, OriginOrToken, and TokenRequired with trusted_origins") {
+    auto make_srv = [](kale::CsrfConfig cfg) {
+        auto srv = std::make_unique<TestServerRunner>();
+        (*srv)->use(kale::csrf(std::move(cfg)));
+        (*srv)->GET("/submit", [](kale::Context &ctx) { ctx.string("ok"); });
+        (*srv)->POST("/submit", [](kale::Context &ctx) { ctx.string("ok"); });
+        srv->start();
+        return srv;
+    };
+
+    // 1. OriginOnly mode: no secret required, no Set-Cookie on GET, enforces Origin/Referer
+    {
+        kale::CsrfConfig cfg;
+        cfg.mode = kale::CsrfMode::OriginOnly;
+        cfg.trusted_origins = {"https://app.example.com"};
+        cfg.allow_referer_fallback = true;
+
+        auto srv_ptr = make_srv(std::move(cfg));
+        auto &srv = *srv_ptr;
+        auto r_get = srv.request("/submit", "GET");
+        CHECK_EQ(r_get.status, 200);
+        CHECK_EQ(r_get.set_cookies().size(), 0);
+        // Valid Origin -> 200
+        auto r_ok = srv.request("/submit", "POST", {{"Origin", "https://app.example.com"}});
+        CHECK_EQ(r_ok.status, 200);
+
+        // Valid Referer fallback -> 200
+        auto r_ref = srv.request("/submit", "POST", {{"Referer", "https://app.example.com/form"}});
+        CHECK_EQ(r_ref.status, 200);
+
+        // Null Origin -> 403
+        auto r_null = srv.request("/submit", "POST", {{"Origin", "null"}});
+        CHECK_EQ(r_null.status, 403);
+
+        // Cross-origin -> 403
+        auto r_evil = srv.request("/submit", "POST", {{"Origin", "https://evil.example.com"}});
+        CHECK_EQ(r_evil.status, 403);
+
+        // Missing Origin and Referer -> 403
+        auto r_missing = srv.request("/submit", "POST");
+        CHECK_EQ(r_missing.status, 403);
+    }
+
+    // 2. OriginOnly with trusted_origin_resolver returning empty -> falls back to Host
+    {
+        kale::CsrfConfig cfg;
+        cfg.mode = kale::CsrfMode::OriginOnly;
+        cfg.allow_referer_fallback = false;
+        cfg.trusted_origin_resolver = [](const kale::Context &ctx) -> std::string {
+            return std::string(ctx.header_view("X-Custom-Origin"));
+        };
+
+        auto srv_ptr = make_srv(std::move(cfg));
+        auto &srv = *srv_ptr;
+        std::string expected_origin = "http://127.0.0.1:" + std::to_string(srv->listen_port());
+        auto r_host = srv.request("/submit", "POST", {
+            {"Origin", expected_origin}
+        });
+        CHECK_EQ(r_host.status, 200);
+
+        // Referer fallback disabled -> 403
+        auto r_ref = srv.request("/submit", "POST", {
+            {"Referer", expected_origin + "/page"}
+        });
+        CHECK_EQ(r_ref.status, 403);
+    }
+
+    // 3. OriginOrToken mode
+    {
+        kale::CsrfConfig cfg;
+        cfg.secret = "0123456789abcdef0123456789abcdef";
+        cfg.secure = false;
+        cfg.mode = kale::CsrfMode::OriginOrToken;
+        cfg.trusted_origins = {"https://app.example.com"};
+
+        auto srv_ptr = make_srv(cfg);
+        auto &srv = *srv_ptr;
+        // Passes with valid Origin even without _csrf cookie
+        auto r_origin = srv.request("/submit", "POST", {{"Origin", "https://app.example.com"}});
+        CHECK_EQ(r_origin.status, 200);
+
+        // Passes with valid Double-Submit token when Origin is absent
+        std::string tok = kale::generate_csrf_token(cfg.secret);
+        auto r_tok = srv.request("/submit", "POST", {
+            {"Cookie", "_csrf=" + tok},
+            {"X-CSRF-Token", tok}
+        });
+        CHECK_EQ(r_tok.status, 200);
+
+        // Fails when Origin is cross-origin and no valid token
+        auto r_fail = srv.request("/submit", "POST", {{"Origin", "https://evil.example.com"}});
+        CHECK_EQ(r_fail.status, 403);
+    }
+
+    // 4. TokenRequired with trusted_origins and allow_form_field = false
+    {
+        kale::CsrfConfig cfg;
+        cfg.secret = "0123456789abcdef0123456789abcdef";
+        cfg.secure = false;
+        cfg.mode = kale::CsrfMode::TokenRequired;
+        cfg.trusted_origins = {"https://app.example.com"};
+        cfg.allow_form_field = false;
+
+        auto srv_ptr = make_srv(cfg);
+        auto &srv = *srv_ptr;
+        std::string tok = kale::generate_csrf_token(cfg.secret);
+
+        // Valid Origin + valid header token -> 200
+        auto r_ok = srv.request("/submit", "POST", {
+            {"Origin", "https://app.example.com"},
+            {"Cookie", "_csrf=" + tok},
+            {"X-CSRF-Token", tok}
+        });
+        CHECK_EQ(r_ok.status, 200);
+
+        // Valid header token but wrong Origin -> 403
+        auto r_bad_origin = srv.request("/submit", "POST", {
+            {"Origin", "https://evil.example.com"},
+            {"Cookie", "_csrf=" + tok},
+            {"X-CSRF-Token", tok}
+        });
+        CHECK_EQ(r_bad_origin.status, 403);
+
+        // Form-field token rejected when allow_form_field = false -> 403
+        auto r_form = srv.request("/submit", "POST", {
+            {"Origin", "https://app.example.com"},
+            {"Cookie", "_csrf=" + tok},
+            {"Content-Type", "application/x-www-form-urlencoded"}
+        }, "_csrf=" + tok);
+        CHECK_EQ(r_form.status, 403);
+    }
+}
+
 } // TEST_SUITE("csrf")

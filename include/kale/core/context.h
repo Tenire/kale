@@ -37,6 +37,12 @@ class StreamReplyAdapter;
 class StreamAccess;
 using ServerContext = coke::ServerContext<protocol::HttpRequest, protocol::HttpResponse>;
 
+enum class ClientIpSource {
+    PeerAddr,      // Direct socket peer_addr() only
+    RealIp,        // X-Real-IP -> peer_addr()
+    ForwardedFor,  // X-Forwarded-For (first comma-separated token) -> peer_addr()
+};
+
 class Context {
     friend class HttpServer;
     friend class Router;
@@ -124,6 +130,8 @@ public:
     std::string_view route_tag(std::string_view key) const noexcept;
     bool has_route_tag(std::string_view key) const noexcept;
     std::string peer_addr() const;
+    std::string client_ip(ClientIpSource source = ClientIpSource::PeerAddr) const;
+    std::string client_ip(std::string_view header_name) const;
     unsigned short peer_port() const noexcept;
 
     template <typename T>

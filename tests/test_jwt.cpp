@@ -915,4 +915,73 @@ TEST_CASE("Header typ validation, kid validation, and VerifiedJwtClaims scalar a
                 .set_clock([]() -> int64_t { return 1750000000; });
     CHECK_EQ(hmac_req_kid.verify_hmac(make_hmac_token("{\"alg\":\"HS256\",\"kid\":\"k1\\u0000other\"}"), secret).error, kale::JwtError::InvalidJson);
 }
+TEST_CASE("JwtValidator::verify with dynamic JwtKeyResolver and bearer_auth integration") {
+    const std::string key_a = "key-a-secret-must-be-at-least-32-bytes-long!";
+    const std::string key_b = "key-b-secret-must-be-at-least-32-bytes-long!";
+
+    kale::JwtClaims claims;
+    claims.set_subject("user-123").set_expires_at(1750003600);
+
+    auto tok_a = kale::JwtSigner::sign_hmac(claims, key_a, kale::JwtAlgorithm::HS256, "key-2026-a");
+    auto tok_b = kale::JwtSigner::sign_hmac(claims, key_b, kale::JwtAlgorithm::HS256, "key-2026-b");
+    auto tok_unknown = kale::JwtSigner::sign_hmac(claims, key_a, kale::JwtAlgorithm::HS256, "unknown-kid");
+    REQUIRE(tok_a.has_value());
+    REQUIRE(tok_b.has_value());
+    REQUIRE(tok_unknown.has_value());
+
+    int resolver_calls = 0;
+    kale::JwtKeyResolver resolver = [&](std::string_view kid, kale::JwtAlgorithm) -> std::optional<kale::JwtKeyMaterial> {
+        resolver_calls++;
+        if (kid == "key-2026-a") return kale::JwtKeyMaterial{key_a, false};
+        if (kid == "key-2026-b") return kale::JwtKeyMaterial{key_b, false};
+        return std::nullopt;
+    };
+
+    kale::JwtValidator validator;
+    validator.allow_algorithm(kale::JwtAlgorithm::HS256)
+             .require_type("JWT")
+             .set_clock([]() -> int64_t { return 1750000000; });
+
+    auto res_a = validator.verify(*tok_a, resolver);
+    REQUIRE(res_a.has_value());
+    CHECK_EQ(res_a->kid(), "key-2026-a");
+    CHECK_EQ(res_a->subject(), "user-123");
+
+    auto res_b = validator.verify(*tok_b, resolver);
+    REQUIRE(res_b.has_value());
+    CHECK_EQ(res_b->kid(), "key-2026-b");
+
+    auto res_unknown = validator.verify(*tok_unknown, resolver);
+    CHECK_FALSE(res_unknown.has_value());
+    CHECK_EQ(res_unknown.error, kale::JwtError::KeyInvalid);
+
+    // Disallowed algorithm must be rejected BEFORE invoking key_resolver
+    auto tok_hs384 = kale::JwtSigner::sign_hmac(claims, "key-384-secret-must-be-at-least-48-bytes-long-0000", kale::JwtAlgorithm::HS384, "key-2026-a");
+    REQUIRE(tok_hs384.has_value());
+    int before_calls = resolver_calls;
+    auto res_disallowed = validator.verify(*tok_hs384, resolver);
+    CHECK_EQ(res_disallowed.error, kale::JwtError::AlgorithmNotAllowed);
+    CHECK_EQ(resolver_calls, before_calls);
+
+    // bearer_auth middleware with key_resolver
+    kale::BearerAuthConfig auth_cfg;
+    auth_cfg.validator = validator;
+    auth_cfg.key_resolver = resolver;
+
+    TestServerRunner srv;
+    srv->use(kale::bearer_auth(std::move(auth_cfg)));
+    srv->GET("/me", [](kale::Context &ctx) {
+        const auto *c = kale::get_jwt_claims(ctx);
+        ctx.string(c ? std::string(c->kid()) : "none");
+    });
+    srv.start();
+
+    auto r_ok = srv.request("/me", "GET", {{"Authorization", "Bearer " + *tok_b}});
+    CHECK_EQ(r_ok.status, 200);
+    CHECK_EQ(r_ok.body, "key-2026-b");
+
+    auto r_bad = srv.request("/me", "GET", {{"Authorization", "Bearer " + *tok_unknown}});
+    CHECK_EQ(r_bad.status, 401);
+    CHECK(r_bad.header("WWW-Authenticate").find("error=\"invalid_token\"") != std::string::npos);
+}
 } // TEST_SUITE("jwt")

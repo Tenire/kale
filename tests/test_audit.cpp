@@ -538,4 +538,59 @@ TEST_CASE("kale::bind_json numeric overflow rejection for nonfinite/infinite num
         }());
     }
 }
+TEST_CASE("TTL-bound signed cookies: sign, verify, expiry, and HTTP round-trip") {
+    const std::string secret = "super-secret-key-for-ttl-cookies-1234";
+    const int64_t issued_at = 1750000000;
+    const std::chrono::seconds max_age(300);
+
+    // 1. Valid within TTL (including values containing dots)
+    std::string signed_val = kale::sign_cookie_value_with_ttl("a.b.c", secret, issued_at);
+    auto ok = kale::unsign_cookie_value_with_ttl(signed_val, secret, max_age, issued_at + 120);
+    REQUIRE(ok.has_value());
+    CHECK_EQ(*ok, "a.b.c");
+
+    // 2. Expired (now - issued_at > max_age)
+    CHECK_FALSE(kale::unsign_cookie_value_with_ttl(signed_val, secret, max_age, issued_at + 301).has_value());
+
+    // 3. Future timestamp (issued_at > now)
+    CHECK_FALSE(kale::unsign_cookie_value_with_ttl(signed_val, secret, max_age, issued_at - 1).has_value());
+
+    // 4. Tampered value or wrong secret
+    CHECK_FALSE(kale::unsign_cookie_value_with_ttl(signed_val, "wrong-secret", max_age, issued_at + 10).has_value());
+    std::string tampered = signed_val;
+    tampered[0] = (tampered[0] == 'a') ? 'z' : 'a';
+    CHECK_FALSE(kale::unsign_cookie_value_with_ttl(tampered, secret, max_age, issued_at + 10).has_value());
+
+    // 5. Plain sign_cookie_value must be rejected by unsign_cookie_value_with_ttl
+    std::string plain_signed = kale::sign_cookie_value("user123", secret);
+    CHECK_FALSE(kale::unsign_cookie_value_with_ttl(plain_signed, secret, max_age, issued_at + 10).has_value());
+
+    // 6. Loopback HTTP round-trip with set_signed_cookie_with_ttl and signed_cookie_with_ttl
+    AuditTestServer server;
+    server.server().GET("/set", [&](kale::Context &ctx) {
+        kale::set_signed_cookie_with_ttl(ctx, "sid", "sess-42", secret, std::chrono::seconds(60));
+        ctx.string("ok");
+    });
+    server.server().GET("/get", [&](kale::Context &ctx) {
+        auto v = kale::signed_cookie_with_ttl(ctx, "sid", secret, std::chrono::seconds(60));
+        ctx.string(v.value_or("missing"));
+    });
+    coke::sync_wait([&]() -> coke::Task<void> {
+        kale::HttpClient client;
+        auto r1 = co_await client.get(server.url("/set")).send();
+        CHECK_EQ(r1.status(), 200);
+        std::string set_cookie_hdr = std::string(r1.header("Set-Cookie"));
+        CHECK(set_cookie_hdr.find("Max-Age=60") != std::string::npos);
+
+        auto semi = set_cookie_hdr.find(';');
+        std::string cookie_kv = (semi == std::string::npos) ? set_cookie_hdr : set_cookie_hdr.substr(0, semi);
+
+        auto r2 = co_await client.get(server.url("/get"))
+            .header("Cookie", cookie_kv)
+            .send();
+        CHECK_EQ(r2.status(), 200);
+        std::string body = co_await r2.read_body();
+        CHECK_EQ(body, "sess-42");
+    }());
+}
 }

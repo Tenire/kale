@@ -243,6 +243,13 @@ public:
 /**
  * JWT Validator enforcing algorithm whitelist, time bounds, and claim checks.
  */
+struct JwtKeyMaterial {
+    std::string key;
+    bool is_pem{false}; // false: HMAC secret; true: PEM Public Key
+};
+
+using JwtKeyResolver = std::function<std::optional<JwtKeyMaterial>(std::string_view kid, JwtAlgorithm alg)>;
+
 class JwtValidator {
 public:
     JwtValidator() = default;
@@ -276,11 +283,16 @@ public:
         std::string_view token,
         std::string_view public_key_pem) const;
 
+    // Verifies token by resolving key material dynamically after header (alg, typ, kid) validation
+    JwtResult<VerifiedJwtClaims> verify(
+        std::string_view token,
+        const JwtKeyResolver &key_resolver) const;
+
 private:
     JwtResult<VerifiedJwtClaims> verify_common(
         std::string_view token,
-        bool is_pem_verifier,
-        std::function<JwtError(std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg)> signature_verifier) const;
+        std::optional<bool> is_pem_verifier,
+        std::function<JwtError(std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg, std::string_view kid)> signature_verifier) const;
     std::vector<JwtAlgorithm> allowed_algs_;
     std::optional<std::string> expected_iss_;
     std::optional<std::string> expected_aud_;
@@ -302,6 +314,7 @@ struct BearerAuthConfig {
     JwtValidator validator;
     std::string secret_or_public_key;
     bool is_pem_key{false}; // false: HMAC secret; true: PEM Public Key
+    JwtKeyResolver key_resolver{};
 
     std::string header_name{"Authorization"};
     std::string header_prefix{"Bearer "};

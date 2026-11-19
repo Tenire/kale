@@ -617,8 +617,8 @@ JwtValidator& JwtValidator::set_clock(std::function<int64_t()> clock_fn) {
 
 JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
     std::string_view token,
-    bool is_pem_verifier,
-    std::function<JwtError(std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg)> signature_verifier) const {
+    std::optional<bool> is_pem_verifier,
+    std::function<JwtError(std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg, std::string_view kid)> signature_verifier) const {
 
     if (token.empty() || token.size() > MAX_JWT_COMPACT_SIZE) {
         return {JwtError::MalformedToken};
@@ -715,11 +715,13 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
 
     // Key family isolation: prevent symmetric/asymmetric key confusion
     bool is_hmac_alg = (alg == JwtAlgorithm::HS256 || alg == JwtAlgorithm::HS384 || alg == JwtAlgorithm::HS512);
-    if (is_pem_verifier && is_hmac_alg) {
-        return {JwtError::AlgorithmNotAllowed};
-    }
-    if (!is_pem_verifier && !is_hmac_alg) {
-        return {JwtError::AlgorithmNotAllowed};
+    if (is_pem_verifier.has_value()) {
+        if (*is_pem_verifier && is_hmac_alg) {
+            return {JwtError::AlgorithmNotAllowed};
+        }
+        if (!*is_pem_verifier && !is_hmac_alg) {
+            return {JwtError::AlgorithmNotAllowed};
+        }
     }
 
     // Validate optional/required 'typ' header parameter
@@ -761,7 +763,7 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
     }
 
     // Verify signature before parsing claims payload.
-    JwtError sig_err = signature_verifier(signing_input, sig_b64, alg);
+    JwtError sig_err = signature_verifier(signing_input, sig_b64, alg, kid);
     if (sig_err != JwtError::None) {
         return {sig_err};
     }
@@ -927,6 +929,149 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_common(
     return {std::move(verified), JwtError::None};
 }
 
+namespace {
+
+JwtError verify_hmac_signature(
+    std::string_view signing_input,
+    std::string_view sig_b64,
+    JwtAlgorithm alg,
+    std::string_view secret) {
+    if (secret.empty() || secret.size() < 32 || secret.starts_with("-----BEGIN")) {
+        return JwtError::KeyInvalid;
+    }
+    if (alg == JwtAlgorithm::HS256) {
+        if (secret.size() < 32) return JwtError::KeyInvalid;
+        if (sig_b64.size() != 43) return JwtError::SignatureMismatch;
+        std::string expected_sig = CryptoUtil::hmac_sha256_base64url(signing_input, secret);
+        return CryptoUtil::constant_time_equals(sig_b64, expected_sig) ? JwtError::None : JwtError::SignatureMismatch;
+    } else if (alg == JwtAlgorithm::HS384) {
+        if (secret.size() < 48) return JwtError::KeyInvalid;
+        if (sig_b64.size() != 64) return JwtError::SignatureMismatch;
+        std::string expected_sig = CryptoUtil::hmac_sha384_base64url(signing_input, secret);
+        return CryptoUtil::constant_time_equals(sig_b64, expected_sig) ? JwtError::None : JwtError::SignatureMismatch;
+    } else if (alg == JwtAlgorithm::HS512) {
+        if (secret.size() < 64) return JwtError::KeyInvalid;
+        if (sig_b64.size() != 86) return JwtError::SignatureMismatch;
+        std::string expected_sig = CryptoUtil::hmac_sha512_base64url(signing_input, secret);
+        return CryptoUtil::constant_time_equals(sig_b64, expected_sig) ? JwtError::None : JwtError::SignatureMismatch;
+    }
+    return JwtError::AlgorithmNotAllowed;
+}
+
+JwtError verify_pem_signature(
+    std::string_view signing_input,
+    std::string_view sig_b64,
+    JwtAlgorithm alg,
+    std::string_view public_key_pem) {
+    if (public_key_pem.empty()) {
+        return JwtError::KeyInvalid;
+    }
+    BIO *bio = BIO_new_mem_buf(public_key_pem.data(), static_cast<int>(public_key_pem.size()));
+    if (!bio) return JwtError::KeyInvalid;
+    UniqueBio u_bio(bio);
+
+    EVP_PKEY *pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    if (!pkey) return JwtError::KeyInvalid;
+    UniqueEvpPkey u_pkey(pkey);
+
+    const char *md_name = nullptr;
+    bool is_ecdsa = false;
+    if (alg == JwtAlgorithm::RS256) {
+        md_name = "SHA256";
+    } else if (alg == JwtAlgorithm::RS384) {
+        md_name = "SHA384";
+    } else if (alg == JwtAlgorithm::RS512) {
+        md_name = "SHA512";
+    } else if (alg == JwtAlgorithm::ES256) {
+        md_name = "SHA256";
+        is_ecdsa = true;
+    } else if (alg == JwtAlgorithm::Ed25519) {
+        md_name = nullptr;
+    } else {
+        return JwtError::AlgorithmNotAllowed;
+    }
+
+    if (is_ecdsa) {
+        if (!is_p256_ec_key(pkey)) {
+            return JwtError::KeyInvalid;
+        }
+    } else if (md_name) {
+        if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA || EVP_PKEY_bits(pkey) < 2048) {
+            return JwtError::KeyInvalid;
+        }
+    } else {
+        if (EVP_PKEY_base_id(pkey) != EVP_PKEY_ED25519) {
+            return JwtError::KeyInvalid;
+        }
+    }
+
+    if (alg == JwtAlgorithm::Ed25519 || is_ecdsa) {
+        if (sig_b64.size() != 86) return JwtError::SignatureMismatch;
+    }
+
+    auto raw_sig = Base64::decode_url(sig_b64);
+    if (!raw_sig) return JwtError::SignatureMismatch;
+
+    unsigned char der_sig[80];
+    const unsigned char *verify_sig_ptr = reinterpret_cast<const unsigned char *>(raw_sig->data());
+    size_t verify_sig_len = raw_sig->size();
+
+    if (is_ecdsa) {
+        if (raw_sig->size() != 64) return JwtError::SignatureMismatch;
+        UniqueBn r(BN_bin2bn(reinterpret_cast<const unsigned char *>(raw_sig->data()), 32, nullptr));
+        UniqueBn s(BN_bin2bn(reinterpret_cast<const unsigned char *>(raw_sig->data() + 32), 32, nullptr));
+        if (!r || !s) {
+            return JwtError::SignatureMismatch;
+        }
+
+        UniqueEcdsaSig ecdsa_sig(ECDSA_SIG_new());
+        if (!ecdsa_sig) {
+            return JwtError::KeyInvalid;
+        }
+        if (ECDSA_SIG_set0(ecdsa_sig.get(), r.get(), s.get()) != 1) {
+            return JwtError::SignatureMismatch;
+        }
+        r.release();
+        s.release();
+
+        int der_len = i2d_ECDSA_SIG(ecdsa_sig.get(), nullptr);
+        if (der_len <= 0 || static_cast<size_t>(der_len) > sizeof(der_sig)) {
+            return JwtError::SignatureMismatch;
+        }
+        unsigned char *der_ptr = der_sig;
+        if (i2d_ECDSA_SIG(ecdsa_sig.get(), &der_ptr) != der_len) {
+            return JwtError::SignatureMismatch;
+        }
+        verify_sig_ptr = der_sig;
+        verify_sig_len = static_cast<size_t>(der_len);
+    } else if (md_name) {
+        int key_size = EVP_PKEY_size(pkey);
+        if (key_size <= 0 || static_cast<size_t>(key_size) != raw_sig->size()) {
+            return JwtError::SignatureMismatch;
+        }
+    } else {
+        if (raw_sig->size() != 64) return JwtError::SignatureMismatch;
+    }
+
+    const EVP_MD *md = md_name ? EVP_get_digestbyname(md_name) : nullptr;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return JwtError::KeyInvalid;
+    UniqueEvpMdCtx u_ctx(ctx);
+
+    if (EVP_DigestVerifyInit(ctx, nullptr, md, nullptr, pkey) != 1) {
+        return JwtError::KeyInvalid;
+    }
+
+    int ret = EVP_DigestVerify(ctx,
+                               verify_sig_ptr,
+                               verify_sig_len,
+                               reinterpret_cast<const unsigned char *>(signing_input.data()),
+                               signing_input.size());
+    return ret == 1 ? JwtError::None : JwtError::SignatureMismatch;
+}
+
+} // namespace
+
 JwtResult<VerifiedJwtClaims> JwtValidator::verify_hmac(
     std::string_view token,
     std::string_view secret) const {
@@ -935,25 +1080,8 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_hmac(
         return {JwtError::KeyInvalid};
     }
 
-    return verify_common(token, false, [secret](std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg) -> JwtError {
-        // Enforce minimum key lengths per RFC 7518 §3.2
-        if (alg == JwtAlgorithm::HS256) {
-            if (secret.size() < 32) return JwtError::KeyInvalid;
-            if (sig_b64.size() != 43) return JwtError::SignatureMismatch;
-            std::string expected_sig = CryptoUtil::hmac_sha256_base64url(signing_input, secret);
-            return CryptoUtil::constant_time_equals(sig_b64, expected_sig) ? JwtError::None : JwtError::SignatureMismatch;
-        } else if (alg == JwtAlgorithm::HS384) {
-            if (secret.size() < 48) return JwtError::KeyInvalid;
-            if (sig_b64.size() != 64) return JwtError::SignatureMismatch;
-            std::string expected_sig = CryptoUtil::hmac_sha384_base64url(signing_input, secret);
-            return CryptoUtil::constant_time_equals(sig_b64, expected_sig) ? JwtError::None : JwtError::SignatureMismatch;
-        } else if (alg == JwtAlgorithm::HS512) {
-            if (secret.size() < 64) return JwtError::KeyInvalid;
-            if (sig_b64.size() != 86) return JwtError::SignatureMismatch;
-            std::string expected_sig = CryptoUtil::hmac_sha512_base64url(signing_input, secret);
-            return CryptoUtil::constant_time_equals(sig_b64, expected_sig) ? JwtError::None : JwtError::SignatureMismatch;
-        }
-        return JwtError::AlgorithmNotAllowed;
+    return verify_common(token, false, [secret](std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg, std::string_view) -> JwtError {
+        return verify_hmac_signature(signing_input, sig_b64, alg, secret);
     });
 }
 
@@ -965,111 +1093,30 @@ JwtResult<VerifiedJwtClaims> JwtValidator::verify_pem(
         return {JwtError::KeyInvalid};
     }
 
-    return verify_common(token, true, [public_key_pem](std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg) -> JwtError {
-        BIO *bio = BIO_new_mem_buf(public_key_pem.data(), static_cast<int>(public_key_pem.size()));
-        if (!bio) return JwtError::KeyInvalid;
-        UniqueBio u_bio(bio);
+    return verify_common(token, true, [public_key_pem](std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg, std::string_view) -> JwtError {
+        return verify_pem_signature(signing_input, sig_b64, alg, public_key_pem);
+    });
+}
 
-        EVP_PKEY *pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
-        if (!pkey) return JwtError::KeyInvalid;
-        UniqueEvpPkey u_pkey(pkey);
-
-        const char *md_name = nullptr;
-        bool is_ecdsa = false;
-        if (alg == JwtAlgorithm::RS256) {
-            md_name = "SHA256";
-        } else if (alg == JwtAlgorithm::RS384) {
-            md_name = "SHA384";
-        } else if (alg == JwtAlgorithm::RS512) {
-            md_name = "SHA512";
-        } else if (alg == JwtAlgorithm::ES256) {
-            md_name = "SHA256";
-            is_ecdsa = true;
-        } else if (alg == JwtAlgorithm::Ed25519) {
-            md_name = nullptr;
-        } else {
-            return JwtError::AlgorithmNotAllowed;
-        }
-
-        // Verify key family & size
-        if (is_ecdsa) {
-            if (!is_p256_ec_key(pkey)) {
-                return JwtError::KeyInvalid;
-            }
-        } else if (md_name) {
-            if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA || EVP_PKEY_bits(pkey) < 2048) {
-                return JwtError::KeyInvalid;
-            }
-        } else {
-            if (EVP_PKEY_base_id(pkey) != EVP_PKEY_ED25519) {
-                return JwtError::KeyInvalid;
-            }
-        }
-
-        // Bounded signature length check before crypto
-        if (alg == JwtAlgorithm::Ed25519 || is_ecdsa) {
-            if (sig_b64.size() != 86) return JwtError::SignatureMismatch;
-        }
-
-        auto raw_sig = Base64::decode_url(sig_b64);
-        if (!raw_sig) return JwtError::SignatureMismatch;
-
-        unsigned char der_sig[80];
-        const unsigned char *verify_sig_ptr = reinterpret_cast<const unsigned char *>(raw_sig->data());
-        size_t verify_sig_len = raw_sig->size();
-
-        if (is_ecdsa) {
-            if (raw_sig->size() != 64) return JwtError::SignatureMismatch;
-            UniqueBn r(BN_bin2bn(reinterpret_cast<const unsigned char *>(raw_sig->data()), 32, nullptr));
-            UniqueBn s(BN_bin2bn(reinterpret_cast<const unsigned char *>(raw_sig->data() + 32), 32, nullptr));
-            if (!r || !s) {
-                return JwtError::SignatureMismatch;
-            }
-
-            UniqueEcdsaSig ecdsa_sig(ECDSA_SIG_new());
-            if (!ecdsa_sig) {
-                return JwtError::KeyInvalid;
-            }
-            if (ECDSA_SIG_set0(ecdsa_sig.get(), r.get(), s.get()) != 1) {
-                return JwtError::SignatureMismatch;
-            }
-            r.release();
-            s.release();
-
-            int der_len = i2d_ECDSA_SIG(ecdsa_sig.get(), nullptr);
-            if (der_len <= 0 || static_cast<size_t>(der_len) > sizeof(der_sig)) {
-                return JwtError::SignatureMismatch;
-            }
-            unsigned char *der_ptr = der_sig;
-            if (i2d_ECDSA_SIG(ecdsa_sig.get(), &der_ptr) != der_len) {
-                return JwtError::SignatureMismatch;
-            }
-            verify_sig_ptr = der_sig;
-            verify_sig_len = static_cast<size_t>(der_len);
-        } else if (md_name) {
-            int key_size = EVP_PKEY_size(pkey);
-            if (key_size <= 0 || static_cast<size_t>(key_size) != raw_sig->size()) {
-                return JwtError::SignatureMismatch;
-            }
-        } else {
-            if (raw_sig->size() != 64) return JwtError::SignatureMismatch;
-        }
-
-        const EVP_MD *md = md_name ? EVP_get_digestbyname(md_name) : nullptr;
-        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-        if (!ctx) return JwtError::KeyInvalid;
-        UniqueEvpMdCtx u_ctx(ctx);
-
-        if (EVP_DigestVerifyInit(ctx, nullptr, md, nullptr, pkey) != 1) {
+JwtResult<VerifiedJwtClaims> JwtValidator::verify(
+    std::string_view token,
+    const JwtKeyResolver &key_resolver) const {
+    if (!key_resolver) {
+        return {JwtError::KeyInvalid};
+    }
+    return verify_common(token, std::nullopt, [&key_resolver](std::string_view signing_input, std::string_view sig_b64, JwtAlgorithm alg, std::string_view kid) -> JwtError {
+        auto key_mat = key_resolver(kid, alg);
+        if (!key_mat || key_mat->key.empty()) {
             return JwtError::KeyInvalid;
         }
-
-        int ret = EVP_DigestVerify(ctx,
-                                   verify_sig_ptr,
-                                   verify_sig_len,
-                                   reinterpret_cast<const unsigned char *>(signing_input.data()),
-                                   signing_input.size());
-        return ret == 1 ? JwtError::None : JwtError::SignatureMismatch;
+        bool is_hmac_alg = (alg == JwtAlgorithm::HS256 || alg == JwtAlgorithm::HS384 || alg == JwtAlgorithm::HS512);
+        if ((key_mat->is_pem && is_hmac_alg) || (!key_mat->is_pem && !is_hmac_alg)) {
+            return JwtError::KeyInvalid;
+        }
+        if (key_mat->is_pem) {
+            return verify_pem_signature(signing_input, sig_b64, alg, key_mat->key);
+        }
+        return verify_hmac_signature(signing_input, sig_b64, alg, key_mat->key);
     });
 }
 
@@ -1080,8 +1127,8 @@ const VerifiedJwtClaims* get_jwt_claims(const Context &ctx) noexcept {
 }
 
 Middleware bearer_auth(BearerAuthConfig config) {
-    if (config.secret_or_public_key.empty()) {
-        throw std::invalid_argument("BearerAuth: secret or public key must not be empty");
+    if (config.secret_or_public_key.empty() && !config.key_resolver) {
+        throw std::invalid_argument("BearerAuth: secret_or_public_key or key_resolver must be provided");
     }
     if (config.header_name.empty()) {
         throw std::invalid_argument("BearerAuth: header_name must not be empty");
@@ -1162,7 +1209,9 @@ Middleware bearer_auth(BearerAuthConfig config) {
         }
 
         JwtResult<VerifiedJwtClaims> res;
-        if (cfg.is_pem_key) {
+        if (cfg.key_resolver) {
+            res = cfg.validator.verify(token, cfg.key_resolver);
+        } else if (cfg.is_pem_key) {
             res = cfg.validator.verify_pem(token, cfg.secret_or_public_key);
         } else {
             res = cfg.validator.verify_hmac(token, cfg.secret_or_public_key);

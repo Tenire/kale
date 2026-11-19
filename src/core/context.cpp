@@ -660,6 +660,54 @@ std::string Context::peer_addr() const {
     return inet_ntop(addr.ss_family, binary, text, sizeof(text)) ? text : "Unknown";
 }
 
+namespace {
+
+std::string extract_ip_from_header_value(std::string_view raw) {
+    const size_t comma = raw.find(',');
+    if (comma != std::string_view::npos) {
+        raw = raw.substr(0, comma);
+    }
+    while (!raw.empty() && (raw.front() == ' ' || raw.front() == '\t')) {
+        raw.remove_prefix(1);
+    }
+    while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t')) {
+        raw.remove_suffix(1);
+    }
+    if (raw.empty()) {
+        return {};
+    }
+    for (unsigned char c : raw) {
+        if (c <= 0x20 || c >= 0x7f) {
+            return {};
+        }
+    }
+    return std::string(raw);
+}
+
+} // namespace
+
+std::string Context::client_ip(std::string_view header_name) const {
+    if (!header_name.empty()) {
+        std::string extracted = extract_ip_from_header_value(header_view(header_name));
+        if (!extracted.empty()) {
+            return extracted;
+        }
+    }
+    return peer_addr();
+}
+
+std::string Context::client_ip(ClientIpSource source) const {
+    switch (source) {
+        case ClientIpSource::PeerAddr:
+            return peer_addr();
+        case ClientIpSource::RealIp:
+            return client_ip(std::string_view("X-Real-IP"));
+        case ClientIpSource::ForwardedFor:
+            return client_ip(std::string_view("X-Forwarded-For"));
+    }
+    return peer_addr();
+}
+
 unsigned short Context::peer_port() const noexcept {
     auto *task = const_cast<ServerContext &>(ctx_).get_task(); // Borrowed: request series owns task.
     sockaddr_storage addr{};

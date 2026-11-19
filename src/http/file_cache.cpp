@@ -13,6 +13,7 @@
 
 #include "coke/condition.h"
 #include "coke/fileio.h"
+#include "kale/core/compress.h"
 
 namespace kale {
 
@@ -36,6 +37,36 @@ std::string compute_strong_etag(std::string_view content) {
     std::ostringstream oss;
     oss << '"' << std::hex << std::setfill('0') << std::setw(16) << hash << '"';
     return oss.str();
+}
+
+bool is_compressible_mime(std::string_view mime) noexcept {
+    size_t semi = mime.find(';');
+    if (semi != std::string_view::npos) {
+        mime = mime.substr(0, semi);
+    }
+    while (!mime.empty() && (mime.back() == ' ' || mime.back() == '\t')) {
+        mime.remove_suffix(1);
+    }
+    if (mime.starts_with("text/")) return true;
+    if (mime == "application/javascript" ||
+        mime == "application/x-javascript" ||
+        mime == "application/json" ||
+        mime == "application/xml" ||
+        mime == "application/xhtml+xml" ||
+        mime == "application/rss+xml" ||
+        mime == "application/atom+xml" ||
+        mime == "application/wasm" ||
+        mime == "image/svg+xml") {
+        return true;
+    }
+    if (mime.ends_with("+xml") || mime.ends_with("+json")) {
+        return true;
+    }
+    return false;
+}
+
+size_t entry_total_bytes(const FileCacheEntry &e) noexcept {
+    return e.content.size() + e.zstd_content.size() + e.gzip_content.size();
 }
 
 } // namespace
@@ -77,7 +108,7 @@ public:
                     lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
                     co_return entry;
                 }
-                resident_bytes_ -= entry->content.size();
+                resident_bytes_ -= entry_total_bytes(*entry);
                 lru_list_.erase(it->second);
                 map_.erase(it);
             } else {
@@ -121,6 +152,24 @@ public:
                 bytes_read += static_cast<size_t>(res.nbytes);
             }
 
+            std::string zstd_buf;
+            std::string gzip_buf;
+            if (read_error == 0 && bytes_read == file_size &&
+                config_.precompress &&
+                file_size >= config_.min_compress_size &&
+                is_compressible_mime(mime_type)) {
+                std::string candidate;
+                if (Compress::zstd(buffer, candidate, config_.zstd_level) &&
+                    candidate.size() < buffer.size()) {
+                    zstd_buf = std::move(candidate);
+                }
+                candidate.clear();
+                if (Compress::gzip(buffer, candidate, config_.gzip_level) &&
+                    candidate.size() < buffer.size()) {
+                    gzip_buf = std::move(candidate);
+                }
+            }
+
             lock.lock();
 
             if (read_error != 0 || bytes_read != file_size) {
@@ -135,13 +184,15 @@ public:
             auto entry = std::make_shared<FileCacheEntry>();
             entry->path_key = path_key;
             entry->content = std::move(buffer);
+            entry->zstd_content = std::move(zstd_buf);
+            entry->gzip_content = std::move(gzip_buf);
             entry->etag = compute_strong_etag(entry->content);
             entry->last_modified = format_http_date(mtime.tv_sec);
             entry->mime_type = std::move(mime_type);
             entry->mtime = mtime;
             entry->size = file_size;
 
-            const size_t entry_bytes = entry->content.size();
+            const size_t entry_bytes = entry_total_bytes(*entry);
 
             // Enforce LRU eviction bounds
             while (!lru_list_.empty() && (
@@ -149,7 +200,7 @@ public:
                 (config_.max_cache_bytes > 0 && resident_bytes_ + entry_bytes > config_.max_cache_bytes)
             )) {
                 auto oldest = lru_list_.back();
-                resident_bytes_ -= oldest->content.size();
+                resident_bytes_ -= entry_total_bytes(*oldest);
                 map_.erase(oldest->path_key);
                 lru_list_.pop_back();
             }

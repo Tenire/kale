@@ -5,6 +5,7 @@
 #include "kale/core/router.h"
 
 #include <chrono>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,6 +16,12 @@ namespace kale {
  * Configuration for Cross-Site Request Forgery (CSRF) protection middleware
  * implementing the signed Double-Submit Cookie pattern.
  */
+enum class CsrfMode {
+    TokenRequired,
+    OriginOnly,
+    OriginOrToken
+};
+
 struct CsrfConfig {
     // "__Host-" prefix enforces Secure=true, Path="/", and empty Domain.
     std::string cookie_name{"_csrf"};
@@ -33,6 +40,11 @@ struct CsrfConfig {
     // Methods exempt from token validation.
     std::vector<std::string> safe_methods{"GET", "HEAD", "OPTIONS", "TRACE"};
     std::vector<std::string> skip_paths{};
+    CsrfMode mode{CsrfMode::TokenRequired};
+    std::vector<std::string> trusted_origins{};
+    std::function<std::string(const Context &)> trusted_origin_resolver{};
+    bool allow_referer_fallback{true};
+    bool allow_form_field{true};
 };
 
 /**

@@ -15,6 +15,12 @@
 #include "coke/http/http_client.h"
 #include "coke/task.h"
 #include "coke/wait.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include "kale/core/compress.h"
+#include "kale/core/error_response.h"
+#include "kale/core/http_error.h"
+#include "kale/middleware/compression.h"
 #include "kale/core/http_server.h"
 #include "kale/http/file_cache.h"
 #include "kale/http/static_files.h"
@@ -563,5 +569,190 @@ TEST_CASE("StaticFiles: Shared FileCache isolates distinct roots with identical 
     auto res_a2 = srv.get("/static_a/file.txt");
     CHECK_EQ(res_a2.status, 200);
     CHECK_EQ(res_a2.body, "PAYLOAD_ALPHA_12345");
+}
+
+TEST_CASE("FileCache: Pre-compression populates variants and tracks resident_bytes") {
+    ScopedTempDir dir;
+    std::string html_payload;
+    for (int i = 0; i < 100; ++i) {
+        html_payload += "<div>Hello Kale Precompressed Static Asset</div>";
+    }
+    std::string html_path = dir.write_file("index.html", html_payload);
+    std::string png_path = dir.write_file("img.png", html_payload);
+    std::string small_path = dir.write_file("small.html", "<html>hi</html>");
+
+    kale::FileCacheConfig cfg;
+    cfg.precompress = true;
+    cfg.min_compress_size = 1024;
+    kale::FileCache cache(cfg);
+
+    auto load_file = [&](const std::string &path, const std::string &mime) {
+        int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        REQUIRE(fd >= 0);
+        struct stat st{};
+        REQUIRE(::fstat(fd, &st) == 0);
+        auto entry = coke::sync_wait(cache.get_or_load(
+            path, fd, static_cast<size_t>(st.st_size), st.st_mtim, mime
+        ));
+        ::close(fd);
+        return entry;
+    };
+
+    auto html_entry = load_file(html_path, "text/html; charset=utf-8");
+    REQUIRE(html_entry != nullptr);
+    CHECK_FALSE(html_entry->zstd_content.empty());
+    CHECK_FALSE(html_entry->gzip_content.empty());
+    CHECK(html_entry->zstd_content.size() < html_entry->content.size());
+    CHECK(html_entry->gzip_content.size() < html_entry->content.size());
+    size_t expected_bytes = html_entry->content.size() +
+                            html_entry->zstd_content.size() +
+                            html_entry->gzip_content.size();
+    CHECK_EQ(cache.resident_bytes(), expected_bytes);
+
+    auto png_entry = load_file(png_path, "image/png");
+    REQUIRE(png_entry != nullptr);
+    CHECK(png_entry->zstd_content.empty());
+    CHECK(png_entry->gzip_content.empty());
+    expected_bytes += png_entry->content.size();
+    CHECK_EQ(cache.resident_bytes(), expected_bytes);
+
+    auto small_entry = load_file(small_path, "text/html");
+    REQUIRE(small_entry != nullptr);
+    CHECK(small_entry->zstd_content.empty());
+    CHECK(small_entry->gzip_content.empty());
+    expected_bytes += small_entry->content.size();
+    CHECK_EQ(cache.resident_bytes(), expected_bytes);
+
+    cache.clear();
+    CHECK_EQ(cache.resident_bytes(), 0);
+}
+
+TEST_CASE("StaticFiles: Negotiated pre-compression, ETag, Range, and compression middleware") {
+    ScopedTempDir dir;
+    std::string js_payload;
+    for (int i = 0; i < 100; ++i) {
+        js_payload += "console.log('kale precompressed static asset bundle');\n";
+    }
+    dir.write_file("app.js", js_payload);
+
+    kale::StaticFilesConfig cfg;
+    cfg.root_dir = dir.str();
+    cfg.url_prefix = "/assets";
+    cfg.enable_cache = true;
+    cfg.cache_config.precompress = true;
+    cfg.cache_config.min_compress_size = 512;
+
+    TestStaticServer srv;
+    srv.server().use(kale::compression());
+    srv.server().GET("/assets/*filepath", kale::static_files(cfg));
+    srv.start();
+
+    // 1. Accept-Encoding: zstd, gzip -> zstd variant
+    auto res_zstd = srv.get("/assets/app.js", {{"Accept-Encoding", "zstd, gzip"}});
+    CHECK_EQ(res_zstd.status, 200);
+    CHECK_EQ(res_zstd.header("Content-Encoding"), "zstd");
+    CHECK_EQ(res_zstd.header("Vary"), "Accept-Encoding");
+    std::string zstd_etag = res_zstd.header("ETag");
+    CHECK(zstd_etag.find("-zstd\"") != std::string::npos);
+    CHECK_EQ(res_zstd.header("Content-Length"), std::to_string(res_zstd.body.size()));
+    std::string unzstd_out;
+    REQUIRE(kale::Compress::unzstd(res_zstd.body, unzstd_out));
+    CHECK_EQ(unzstd_out, js_payload);
+
+    // 2. Accept-Encoding: gzip -> gzip variant
+    auto res_gzip = srv.get("/assets/app.js", {{"Accept-Encoding", "gzip"}});
+    CHECK_EQ(res_gzip.status, 200);
+    CHECK_EQ(res_gzip.header("Content-Encoding"), "gzip");
+    CHECK_EQ(res_gzip.header("Vary"), "Accept-Encoding");
+    std::string gzip_etag = res_gzip.header("ETag");
+    CHECK(gzip_etag.find("-gzip\"") != std::string::npos);
+    std::string ungzip_out;
+    REQUIRE(kale::Compress::ungzip(res_gzip.body, ungzip_out));
+    CHECK_EQ(ungzip_out, js_payload);
+
+    // 3. No Accept-Encoding -> identity
+    auto res_id = srv.get("/assets/app.js");
+    CHECK_EQ(res_id.status, 200);
+    CHECK(res_id.header("Content-Encoding").empty());
+    CHECK_EQ(res_id.header("Vary"), "Accept-Encoding");
+    std::string id_etag = res_id.header("ETag");
+    CHECK(id_etag.find("-zstd") == std::string::npos);
+    CHECK(id_etag.find("-gzip") == std::string::npos);
+    CHECK_EQ(res_id.body, js_payload);
+
+    // 4. Conditional 304 with matching representation ETag vs 200 with mismatched identity ETag
+    auto res_304 = srv.get("/assets/app.js", {
+        {"Accept-Encoding", "zstd"},
+        {"If-None-Match", zstd_etag}
+    });
+    CHECK_EQ(res_304.status, 304);
+    CHECK_EQ(res_304.header("Vary"), "Accept-Encoding");
+
+    auto res_200_mismatch = srv.get("/assets/app.js", {
+        {"Accept-Encoding", "zstd"},
+        {"If-None-Match", id_etag}
+    });
+    CHECK_EQ(res_200_mismatch.status, 200);
+    CHECK_EQ(res_200_mismatch.header("Content-Encoding"), "zstd");
+
+    // 5. Range request with Accept-Encoding: zstd still serves 206 over raw bytes
+    auto res_range = srv.get("/assets/app.js", {
+        {"Accept-Encoding", "zstd"},
+        {"Range", "bytes=0-63"}
+    });
+    CHECK_EQ(res_range.status, 206);
+    CHECK(res_range.header("Content-Encoding").empty());
+    CHECK_EQ(res_range.body, js_payload.substr(0, 64));
+}
+
+TEST_CASE("StaticFiles: serve_cached_file, SPA routing composition, and custom status") {
+    ScopedTempDir dir;
+    std::string index_html = "<!doctype html><html><body>SPA Root</body></html>";
+    std::string error_html = "<!doctype html><html><body>Custom 404</body></html>";
+    std::string favicon_data = "ICON_DATA_1234";
+    std::string index_path = dir.write_file("index.html", index_html);
+    std::string error_path = dir.write_file("404.html", error_html);
+    std::string favicon_path = dir.write_file("favicon.ico", favicon_data);
+
+    kale::FileCacheConfig cache_cfg;
+    cache_cfg.precompress = true;
+    cache_cfg.min_compress_size = 16;
+    kale::FileCache custom_cache(cache_cfg);
+
+    TestStaticServer srv;
+    srv.server().GET("/api/ping", [](kale::Context &ctx) -> coke::Task<void> {
+        ctx.set_status(200).string("pong");
+        co_return;
+    });
+    srv.server().GET("/favicon.ico", [favicon_path](kale::Context &ctx) -> coke::Task<void> {
+        co_await kale::serve_cached_file(ctx, favicon_path);
+    });
+    srv.server().GET("/custom-404", [error_path, &custom_cache](kale::Context &ctx) -> coke::Task<void> {
+        co_await kale::serve_cached_file(ctx, error_path, custom_cache, {.status_code = 404});
+    });
+    srv.server().set_not_found_handler([index_path, &custom_cache](kale::Context &ctx) -> coke::Task<void> {
+        if (ctx.header_view("Accept").find("text/html") != std::string_view::npos &&
+            !ctx.path().starts_with("/api/")) {
+            co_await kale::serve_cached_file(ctx, index_path, custom_cache);
+            co_return;
+        }
+        kale::reply_error(ctx, kale::HttpError::not_found("Not Found"));
+    });
+    srv.start();
+
+    auto res_fav = srv.get("/favicon.ico");
+    CHECK_EQ(res_fav.status, 200);
+    CHECK_EQ(res_fav.body, favicon_data);
+
+    auto res_spa = srv.get("/dashboard/settings", {{"Accept", "text/html,application/xhtml+xml"}});
+    CHECK_EQ(res_spa.status, 200);
+    CHECK_EQ(res_spa.body, index_html);
+
+    auto res_api_404 = srv.get("/api/unknown", {{"Accept", "text/html"}});
+    CHECK_EQ(res_api_404.status, 404);
+
+    auto res_custom_404 = srv.get("/custom-404");
+    CHECK_EQ(res_custom_404.status, 404);
+    CHECK_EQ(res_custom_404.body, error_html);
 }
 } // TEST_SUITE("static_cache")

@@ -13,6 +13,8 @@ namespace kale {
 struct FileCacheEntry {
     std::string path_key;
     std::string content;
+    std::string zstd_content;
+    std::string gzip_content;
     std::string etag;
     std::string last_modified;
     std::string mime_type;
@@ -25,6 +27,10 @@ struct FileCacheConfig {
     size_t max_file_size{4 * 1024 * 1024};    // 4 MB maximum per single file for memory caching
     size_t max_cache_bytes{64 * 1024 * 1024}; // 64 MB maximum payload budget (0 = unlimited)
     bool check_mtime{true};                   // Invalidate and reload if mtime or size changed
+    bool precompress{false};               // Pre-compute zstd/gzip variants on cache load
+    size_t min_compress_size{1024};        // Minimum file size in bytes for pre-compression
+    int zstd_level{9};                     // Zstd compression level for cached static assets
+    int gzip_level{6};                     // Gzip compression level for cached static assets
 };
 
 /**

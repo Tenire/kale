@@ -255,6 +255,7 @@ coke::Task<void> HttpServer::process(ServerContext server_ctx) {
                                         Context &fallback_ctx) -> coke::Task<void> {
                 if (method_not_allowed) {
                     fallback_ctx.set_header("Allow", allow_hdr);
+                    fallback_ctx.set_status(HttpStatus::MethodNotAllowed);
                     if (method_not_allowed_handler_) {
                         if (method_not_allowed_handler_.is_sync()) {
                             method_not_allowed_handler_.invoke_sync(fallback_ctx);
@@ -265,6 +266,7 @@ coke::Task<void> HttpServer::process(ServerContext server_ctx) {
                         reply_error(fallback_ctx, HttpError::method_not_allowed(allow_hdr));
                     }
                 } else {
+                    fallback_ctx.set_status(HttpStatus::NotFound);
                     if (not_found_handler_) {
                         if (not_found_handler_.is_sync()) {
                             not_found_handler_.invoke_sync(fallback_ctx);
@@ -288,12 +290,14 @@ coke::Task<void> HttpServer::process(ServerContext server_ctx) {
                 if (is_sync) {
                     if (result.method_not_allowed) {
                         ctx.set_header("Allow", result.allow_header());
+                        ctx.set_status(HttpStatus::MethodNotAllowed);
                         if (method_not_allowed_handler_) {
                             method_not_allowed_handler_.invoke_sync(ctx);
                         } else {
                             reply_error(ctx, HttpError::method_not_allowed(result.allow_header()));
                         }
                     } else {
+                        ctx.set_status(HttpStatus::NotFound);
                         if (not_found_handler_) {
                             not_found_handler_.invoke_sync(ctx);
                         } else {

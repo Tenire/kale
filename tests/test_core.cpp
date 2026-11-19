@@ -4221,4 +4221,150 @@ TEST_CASE("Deterministic SSE postcommit fixed-length overflow and abort") {
     CHECK_EQ(raw.body.find("500 Internal Server Error"), std::string::npos);
     CHECK_EQ(raw.body.find("HTTP/1.1 500"), std::string::npos);
 }
+
+TEST_CASE("Context client_ip single-source resolution and fallback") {
+    CoreTestServer server;
+    server->GET("/ip/peer", [](kale::Context &ctx) {
+        ctx.string(ctx.client_ip());
+    });
+    server->GET("/ip/real", [](kale::Context &ctx) {
+        ctx.string(ctx.client_ip(kale::ClientIpSource::RealIp));
+    });
+    server->GET("/ip/xff", [](kale::Context &ctx) {
+        ctx.string(ctx.client_ip(kale::ClientIpSource::ForwardedFor));
+    });
+    server->GET("/ip/cf", [](kale::Context &ctx) {
+        ctx.string(ctx.client_ip("CF-Connecting-IP"));
+    });
+
+    RawResponse peer_res = send_raw_http(server.port(),
+        "GET /ip/peer HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "X-Forwarded-For: 203.0.113.195\r\nX-Real-IP: 198.51.100.2\r\n"
+        "Connection: close\r\n\r\n");
+    CHECK_EQ(peer_res.status, 200);
+    CHECK_EQ(peer_res.body, "127.0.0.1");
+
+    RawResponse real_res = send_raw_http(server.port(),
+        "GET /ip/real HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "X-Forwarded-For: 203.0.113.195\r\nX-Real-IP:   198.51.100.2  \r\n"
+        "Connection: close\r\n\r\n");
+    CHECK_EQ(real_res.status, 200);
+    CHECK_EQ(real_res.body, "198.51.100.2");
+
+    RawResponse real_missing = send_raw_http(server.port(),
+        "GET /ip/real HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "X-Forwarded-For: 203.0.113.195\r\nX-Real-IP:   \r\n"
+        "Connection: close\r\n\r\n");
+    CHECK_EQ(real_missing.status, 200);
+    CHECK_EQ(real_missing.body, "127.0.0.1");
+
+    RawResponse xff_res = send_raw_http(server.port(),
+        "GET /ip/xff HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "X-Real-IP: 198.51.100.2\r\n"
+        "X-Forwarded-For: 203.0.113.195, 70.41.3.18, 150.172.238.178\r\n"
+        "Connection: close\r\n\r\n");
+    CHECK_EQ(xff_res.status, 200);
+    CHECK_EQ(xff_res.body, "203.0.113.195");
+
+    RawResponse xff_empty_first = send_raw_http(server.port(),
+        "GET /ip/xff HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "X-Forwarded-For: , 70.41.3.18\r\n"
+        "Connection: close\r\n\r\n");
+    CHECK_EQ(xff_empty_first.status, 200);
+    CHECK_EQ(xff_empty_first.body, "127.0.0.1");
+
+    RawResponse cf_res = send_raw_http(server.port(),
+        "GET /ip/cf HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "CF-Connecting-IP: 192.0.2.44\r\n"
+        "Connection: close\r\n\r\n");
+    CHECK_EQ(cf_res.status, 200);
+    CHECK_EQ(cf_res.body, "192.0.2.44");
+
+    RawResponse cf_missing = send_raw_http(server.port(),
+        "GET /ip/cf HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "Connection: close\r\n\r\n");
+    CHECK_EQ(cf_missing.status, 200);
+    CHECK_EQ(cf_missing.body, "127.0.0.1");
+}
+
+TEST_CASE("HttpServer presets 404 and 405 before custom fallback handlers") {
+    SUBCASE("sync without middleware") {
+        CoreTestServer server;
+        server->GET("/only-get", [](kale::Context &ctx) { ctx.string("ok"); });
+        server->set_not_found_handler([](kale::Context &ctx) {
+            ctx.string("custom 404");
+        });
+        server->set_method_not_allowed_handler([](kale::Context &ctx) {
+            ctx.string("custom 405");
+        });
+
+        RawResponse r404 = send_raw_http(server.port(),
+            "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        CHECK_EQ(r404.status, 404);
+        CHECK_EQ(r404.body, "custom 404");
+
+        RawResponse r405 = send_raw_http(server.port(),
+            "POST /only-get HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        CHECK_EQ(r405.status, 405);
+        CHECK_EQ(r405.body, "custom 405");
+        CHECK(r405.headers.find("Allow") != std::string::npos);
+    }
+
+    SUBCASE("async without middleware") {
+        CoreTestServer server;
+        server->GET("/only-get", [](kale::Context &ctx) { ctx.string("ok"); });
+        server->set_not_found_handler([](kale::Context &ctx) -> coke::Task<void> {
+            ctx.string("async 404");
+            co_return;
+        });
+        server->set_method_not_allowed_handler([](kale::Context &ctx) -> coke::Task<void> {
+            ctx.string("async 405");
+            co_return;
+        });
+
+        RawResponse r404 = send_raw_http(server.port(),
+            "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        CHECK_EQ(r404.status, 404);
+        CHECK_EQ(r404.body, "async 404");
+
+        RawResponse r405 = send_raw_http(server.port(),
+            "POST /only-get HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        CHECK_EQ(r405.status, 405);
+        CHECK_EQ(r405.body, "async 405");
+        CHECK(r405.headers.find("Allow") != std::string::npos);
+    }
+
+    SUBCASE("with middleware and SPA status override") {
+        CoreTestServer server;
+        server->use([](kale::Context &, kale::Next next) -> coke::Task<void> {
+            co_await next();
+        });
+        server->GET("/only-get", [](kale::Context &ctx) { ctx.string("ok"); });
+        server->set_not_found_handler([](kale::Context &ctx) {
+            ctx.string("mw 404");
+        });
+        server->set_method_not_allowed_handler([](kale::Context &ctx) {
+            ctx.string("mw 405");
+        });
+
+        RawResponse r404 = send_raw_http(server.port(),
+            "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        CHECK_EQ(r404.status, 404);
+        CHECK_EQ(r404.body, "mw 404");
+
+        RawResponse r405 = send_raw_http(server.port(),
+            "POST /only-get HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        CHECK_EQ(r405.status, 405);
+        CHECK_EQ(r405.body, "mw 405");
+
+        CoreTestServer spa_server;
+        spa_server->set_not_found_handler([](kale::Context &ctx) {
+            ctx.set_status(200).string("spa index");
+        });
+        RawResponse spa_res = send_raw_http(spa_server.port(),
+            "GET /app/route HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        CHECK_EQ(spa_res.status, 200);
+        CHECK_EQ(spa_res.body, "spa index");
+    }
+}
 } // TEST_SUITE("core")

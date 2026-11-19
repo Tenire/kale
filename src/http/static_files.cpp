@@ -19,6 +19,7 @@
 
 #include "coke/fileio.h"
 #include "coke/go.h"
+#include "kale/core/compress.h"
 #include "kale/core/context.h"
 #include "kale/core/router.h"
 #include "kale/http/file_cache.h"
@@ -267,6 +268,205 @@ coke::Task<void> stream_descriptor(Context &ctx, FileDescriptor &fd, size_t star
     }
     co_await ctx.end_chunk();
     co_await fd.close();
+}
+
+std::string make_representation_etag(std::string_view base_etag, std::string_view suffix) {
+    if (suffix.empty()) {
+        return std::string(base_etag);
+    }
+    if (base_etag.size() >= 2 && base_etag.back() == '"') {
+        std::string out;
+        out.reserve(base_etag.size() + 1 + suffix.size());
+        out.append(base_etag.substr(0, base_etag.size() - 1));
+        out.push_back('-');
+        out.append(suffix);
+        out.push_back('"');
+        return out;
+    }
+    std::string out(base_etag);
+    out.push_back('-');
+    out.append(suffix);
+    return out;
+}
+
+coke::Task<void> serve_resolved_file(
+    Context &ctx,
+    FileDescriptor &fd,
+    const struct stat &st,
+    std::shared_ptr<const FileCacheEntry> entry,
+    std::string_view mime_type,
+    std::string_view cache_control,
+    int status_code
+) {
+    std::string raw_etag;
+    std::string last_modified;
+    size_t file_size = 0;
+    timespec mtime{};
+
+    if (entry != nullptr) {
+        raw_etag = entry->etag;
+        last_modified = entry->last_modified;
+        file_size = entry->size;
+        mtime = entry->mtime;
+        co_await fd.close();
+    } else {
+        std::ostringstream oss;
+        oss << "W/\"" << std::hex << st.st_size << '-'
+            << st.st_mtim.tv_sec << '-'
+            << st.st_mtim.tv_nsec << '"';
+        raw_etag = oss.str();
+        last_modified = format_http_date(st.st_mtim.tv_sec);
+        file_size = static_cast<size_t>(st.st_size);
+        mtime = st.st_mtim;
+    }
+
+    const bool has_precompressed = (entry != nullptr) &&
+        (!entry->zstd_content.empty() || !entry->gzip_content.empty());
+
+    bool handle_range = false;
+    RangeSpec rspec;
+    if (status_code == static_cast<int>(HttpStatus::OK) && ctx.method() == HttpMethod::GET && ctx.has_header("Range")) {
+        std::string r_hdr = ctx.header("Range");
+        std::string if_r_hdr = ctx.has_header("If-Range") ? ctx.header("If-Range") : "";
+        if (should_satisfy_range(if_r_hdr, raw_etag, mtime)) {
+            rspec = parse_byte_range(r_hdr, file_size);
+            if (rspec.has_range) {
+                handle_range = true;
+            }
+        }
+    }
+
+    const std::string *selected_body = nullptr;
+    std::string_view content_encoding;
+    if (!handle_range && has_precompressed) {
+        std::string_view ae = ctx.header_view("Accept-Encoding");
+        CompressionEncoding enc = Compress::negotiate(ae);
+        if (enc == CompressionEncoding::Zstd && !entry->zstd_content.empty()) {
+            selected_body = &entry->zstd_content;
+            content_encoding = "zstd";
+        } else if (!entry->gzip_content.empty() &&
+                   (enc == CompressionEncoding::Gzip ||
+                    (enc == CompressionEncoding::Zstd && entry->zstd_content.empty() &&
+                     Compress::negotiate(ae, {CompressionEncoding::Gzip}) == CompressionEncoding::Gzip))) {
+            selected_body = &entry->gzip_content;
+            content_encoding = "gzip";
+        }
+    }
+
+    std::string selected_etag = make_representation_etag(raw_etag, content_encoding);
+
+    if (status_code == static_cast<int>(HttpStatus::OK)) {
+        // RFC 7232 precedence: If-Match -> If-Unmodified-Since -> If-None-Match -> If-Modified-Since
+        if (ctx.has_header("If-Match")) {
+            if (!if_match_satisfied(ctx.header("If-Match"), selected_etag)) {
+                if (fd.get() >= 0) co_await fd.close();
+                ctx.set_status(412).string("Precondition Failed");
+                co_return;
+            }
+        } else if (ctx.has_header("If-Unmodified-Since")) {
+            time_t unmod_date = 0;
+            if (parse_http_date(ctx.header("If-Unmodified-Since"), unmod_date)) {
+                if (mtime.tv_sec > unmod_date) {
+                    if (fd.get() >= 0) co_await fd.close();
+                    ctx.set_status(412).string("Precondition Failed");
+                    co_return;
+                }
+            }
+        }
+
+        if (ctx.has_header("If-None-Match")) {
+            if (if_none_match_matches(ctx.header("If-None-Match"), selected_etag)) {
+                if (fd.get() >= 0) co_await fd.close();
+                ctx.set_status(HttpStatus::NotModified);
+                ctx.set_header("ETag", selected_etag);
+                ctx.set_header("Last-Modified", last_modified);
+                if (has_precompressed) ctx.set_header("Vary", "Accept-Encoding");
+                if (!cache_control.empty()) ctx.set_header("Cache-Control", cache_control);
+                ctx.set_header("Content-Length", "0");
+                co_return;
+            }
+        } else if (ctx.has_header("If-Modified-Since")) {
+            time_t mod_date = 0;
+            if (parse_http_date(ctx.header("If-Modified-Since"), mod_date)) {
+                if (mtime.tv_sec <= mod_date) {
+                    if (fd.get() >= 0) co_await fd.close();
+                    ctx.set_status(HttpStatus::NotModified);
+                    ctx.set_header("ETag", selected_etag);
+                    ctx.set_header("Last-Modified", last_modified);
+                    if (has_precompressed) ctx.set_header("Vary", "Accept-Encoding");
+                    if (!cache_control.empty()) ctx.set_header("Cache-Control", cache_control);
+                    ctx.set_header("Content-Length", "0");
+                    co_return;
+                }
+            }
+        }
+
+        ctx.set_header("Accept-Ranges", "bytes");
+    }
+
+    ctx.set_header("ETag", selected_etag);
+    ctx.set_header("Last-Modified", last_modified);
+    if (has_precompressed) ctx.set_header("Vary", "Accept-Encoding");
+    if (!cache_control.empty()) ctx.set_header("Cache-Control", cache_control);
+
+    if (handle_range) {
+        if (!rspec.valid) {
+            if (fd.get() >= 0) co_await fd.close();
+            ctx.set_status(HttpStatus::RangeNotSatisfiable);
+            ctx.set_header("Content-Range", "bytes */" + std::to_string(file_size));
+            ctx.set_header("Content-Length", "0");
+            co_return;
+        }
+
+        size_t start = rspec.start;
+        size_t end = rspec.end;
+        size_t length = end - start;
+
+        ctx.set_status(HttpStatus::PartialContent);
+        ctx.set_header("Content-Range", "bytes " + std::to_string(start) + "-" + std::to_string(end - 1) + "/" + std::to_string(file_size));
+        ctx.set_header("Content-Length", std::to_string(length));
+        ctx.set_content_type(mime_type);
+
+        if (ctx.method() == HttpMethod::HEAD) {
+            if (fd.get() >= 0) co_await fd.close();
+            co_return;
+        }
+
+        if (entry != nullptr) {
+            ctx.body(std::string_view(entry->content).substr(start, length));
+            co_return;
+        }
+
+        co_await stream_descriptor(ctx, fd, start, end);
+        co_return;
+    }
+
+    ctx.set_status(status_code);
+    ctx.set_content_type(mime_type);
+
+    if (selected_body != nullptr) {
+        ctx.set_header("Content-Encoding", content_encoding);
+        ctx.set_header("Content-Length", std::to_string(selected_body->size()));
+        if (ctx.method() == HttpMethod::HEAD) {
+            co_return;
+        }
+        ctx.body(*selected_body);
+        co_return;
+    }
+
+    ctx.set_header("Content-Length", std::to_string(file_size));
+
+    if (ctx.method() == HttpMethod::HEAD) {
+        if (fd.get() >= 0) co_await fd.close();
+        co_return;
+    }
+
+    if (entry != nullptr) {
+        ctx.body(entry->content);
+        co_return;
+    }
+
+    co_await stream_descriptor(ctx, fd, 0, file_size);
 }
 
 struct ResolveResult {
@@ -571,136 +771,10 @@ Handler make_static_files_handler(StaticFilesConfig config,
             }
         }
 
-        std::string etag;
-        std::string last_modified;
-        size_t file_size = 0;
-        timespec mtime{};
-
-        if (entry != nullptr) {
-            etag = entry->etag;
-            last_modified = entry->last_modified;
-            file_size = entry->size;
-            mtime = entry->mtime;
-            co_await fd.close();
-        } else {
-            std::ostringstream oss;
-            oss << "W/\"" << std::hex << resolved.st.st_size << '-'
-                << resolved.st.st_mtim.tv_sec << '-'
-                << resolved.st.st_mtim.tv_nsec << '"';
-            etag = oss.str();
-            last_modified = format_http_date(resolved.st.st_mtim.tv_sec);
-            file_size = static_cast<size_t>(resolved.st.st_size);
-            mtime = resolved.st.st_mtim;
-        }
-
-        // RFC 7232 precedence: If-Match -> If-Unmodified-Since -> If-None-Match -> If-Modified-Since
-        if (ctx.has_header("If-Match")) {
-            if (!if_match_satisfied(ctx.header("If-Match"), etag)) {
-                if (fd.get() >= 0) co_await fd.close();
-                ctx.set_status(412).string("Precondition Failed");
-                co_return;
-            }
-        } else if (ctx.has_header("If-Unmodified-Since")) {
-            time_t unmod_date = 0;
-            if (parse_http_date(ctx.header("If-Unmodified-Since"), unmod_date)) {
-                if (mtime.tv_sec > unmod_date) {
-                    if (fd.get() >= 0) co_await fd.close();
-                    ctx.set_status(412).string("Precondition Failed");
-                    co_return;
-                }
-            }
-        }
-
-        if (ctx.has_header("If-None-Match")) {
-            if (if_none_match_matches(ctx.header("If-None-Match"), etag)) {
-                if (fd.get() >= 0) co_await fd.close();
-                ctx.set_status(HttpStatus::NotModified);
-                ctx.set_header("ETag", etag);
-                ctx.set_header("Last-Modified", last_modified);
-                if (!config.cache_control.empty()) ctx.set_header("Cache-Control", config.cache_control);
-                ctx.set_header("Content-Length", "0");
-                co_return;
-            }
-        } else if (ctx.has_header("If-Modified-Since")) {
-            time_t mod_date = 0;
-            if (parse_http_date(ctx.header("If-Modified-Since"), mod_date)) {
-                if (mtime.tv_sec <= mod_date) {
-                    if (fd.get() >= 0) co_await fd.close();
-                    ctx.set_status(HttpStatus::NotModified);
-                    ctx.set_header("ETag", etag);
-                    ctx.set_header("Last-Modified", last_modified);
-                    if (!config.cache_control.empty()) ctx.set_header("Cache-Control", config.cache_control);
-                    ctx.set_header("Content-Length", "0");
-                    co_return;
-                }
-            }
-        }
-
-        ctx.set_header("Accept-Ranges", "bytes");
-        ctx.set_header("ETag", etag);
-        ctx.set_header("Last-Modified", last_modified);
-        if (!config.cache_control.empty()) ctx.set_header("Cache-Control", config.cache_control);
-
-        bool handle_range = false;
-        RangeSpec rspec;
-        if (ctx.method() == HttpMethod::GET && ctx.has_header("Range")) {
-            std::string r_hdr = ctx.header("Range");
-            std::string if_r_hdr = ctx.has_header("If-Range") ? ctx.header("If-Range") : "";
-            if (should_satisfy_range(if_r_hdr, etag, mtime)) {
-                rspec = parse_byte_range(r_hdr, file_size);
-                if (rspec.has_range) {
-                    handle_range = true;
-                }
-            }
-        }
-
-        if (handle_range) {
-            if (!rspec.valid) {
-                if (fd.get() >= 0) co_await fd.close();
-                ctx.set_status(HttpStatus::RangeNotSatisfiable);
-                ctx.set_header("Content-Range", "bytes */" + std::to_string(file_size));
-                ctx.set_header("Content-Length", "0");
-                co_return;
-            }
-
-            size_t start = rspec.start;
-            size_t end = rspec.end;
-            size_t length = end - start;
-
-            ctx.set_status(HttpStatus::PartialContent);
-            ctx.set_header("Content-Range", "bytes " + std::to_string(start) + "-" + std::to_string(end - 1) + "/" + std::to_string(file_size));
-            ctx.set_header("Content-Length", std::to_string(length));
-            ctx.set_content_type(mime_type);
-
-            if (ctx.method() == HttpMethod::HEAD) {
-                if (fd.get() >= 0) co_await fd.close();
-                co_return;
-            }
-
-            if (entry != nullptr) {
-                ctx.body(std::string_view(entry->content).substr(start, length));
-                co_return;
-            }
-
-            co_await stream_descriptor(ctx, fd, start, end);
-            co_return;
-        }
-
-        ctx.set_status(HttpStatus::OK);
-        ctx.set_header("Content-Length", std::to_string(file_size));
-        ctx.set_content_type(mime_type);
-
-        if (ctx.method() == HttpMethod::HEAD) {
-            if (fd.get() >= 0) co_await fd.close();
-            co_return;
-        }
-
-        if (entry != nullptr) {
-            ctx.body(entry->content);
-            co_return;
-        }
-
-        co_await stream_descriptor(ctx, fd, 0, file_size);
+        co_await serve_resolved_file(
+            ctx, fd, resolved.st, std::move(entry),
+            mime_type, config.cache_control, static_cast<int>(HttpStatus::OK)
+        );
         co_return;
     };
 }
@@ -729,4 +803,89 @@ Handler static_files(StaticFilesConfig config, std::shared_ptr<FileCache> cache)
     return make_static_files_handler(std::move(config), std::move(cache), observer);
 }
 
+
+FileCache &default_file_cache() {
+    static FileCache instance;
+    return instance;
+}
+
+coke::Task<void> serve_cached_file(
+    Context &ctx,
+    std::string_view file_path,
+    CachedFileOptions options
+) {
+    co_await serve_cached_file(ctx, file_path, default_file_cache(), std::move(options));
+}
+
+coke::Task<void> serve_cached_file(
+    Context &ctx,
+    std::string_view file_path,
+    FileCache &cache,
+    CachedFileOptions options
+) {
+    if (ctx.method() != HttpMethod::GET && ctx.method() != HttpMethod::HEAD) {
+        reply_error(ctx, HttpError::method_not_allowed("GET, HEAD", "Method Not Allowed"));
+        co_return;
+    }
+
+    if (file_path.empty() || file_path.find('\0') != std::string_view::npos) {
+        reply_error(ctx, HttpError::bad_request("Bad Request: Invalid file path"));
+        co_return;
+    }
+
+    std::string path_str(file_path);
+    struct OpenResult {
+        int fd{-1};
+        int err{0};
+        struct stat st{};
+    };
+
+    auto open_res = co_await coke::go([&]() -> OpenResult {
+        OpenResult r;
+        int raw_fd = ::open(path_str.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (raw_fd < 0) {
+            r.err = errno;
+            return r;
+        }
+        if (::fstat(raw_fd, &r.st) != 0) {
+            r.err = errno;
+            ::close(raw_fd);
+            return r;
+        }
+        if (!S_ISREG(r.st.st_mode)) {
+            r.err = EACCES;
+            ::close(raw_fd);
+            return r;
+        }
+        r.fd = raw_fd;
+        return r;
+    });
+
+    if (open_res.fd < 0) {
+        if (open_res.err == ENOENT || open_res.err == ENOTDIR) {
+            reply_error(ctx, HttpError::not_found("Not Found"));
+        } else if (open_res.err == EACCES || open_res.err == EPERM || open_res.err == ELOOP) {
+            reply_error(ctx, HttpError::forbidden("Forbidden"));
+        } else {
+            reply_error(ctx, HttpError::internal_error("Internal Server Error"));
+        }
+        co_return;
+    }
+
+    FileDescriptor fd(open_res.fd);
+    std::string mime_type = std::string(get_mime_type(path_str));
+    if (mime_type.empty()) {
+        mime_type = options.default_content_type;
+    }
+
+    std::shared_ptr<const FileCacheEntry> entry = co_await cache.get_or_load(
+        path_str, fd.get(), static_cast<size_t>(open_res.st.st_size),
+        open_res.st.st_mtim, mime_type
+    );
+
+    co_await serve_resolved_file(
+        ctx, fd, open_res.st, std::move(entry),
+        mime_type, options.cache_control, options.status_code
+    );
+}
 } // namespace kale
