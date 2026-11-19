@@ -23,6 +23,11 @@
 
 namespace {
 
+template <typename T>
+concept HasRawException = requires(const T &t) { t.raw_exception; };
+template <typename T>
+concept HasException = requires(const T &t) { t.exception; };
+
 using Headers = std::vector<std::pair<std::string, std::string>>;
 
 struct ClientResponse {
@@ -306,4 +311,145 @@ TEST_CASE("ErrorContext and LogContext auto-populate request_id in reply_error")
     CHECK(res.status == 500);
     CHECK(captured_err_req_id == "err-req-999");
     CHECK(captured_log_req_id == "err-req-999");
+}
+
+TEST_CASE("ErrorPolicy::on_error observes unredacted diagnostics without leaking to formatters") {
+    int obs_status = 0;
+    std::string obs_source;
+    std::string obs_reason;
+    std::string obs_message;
+    std::string obs_req_id;
+    std::string obs_internal_secret;
+    bool obs_exposed = true;
+    bool obs_has_exception = false;
+
+    kale::ErrorPolicy policy;
+    policy.expose_internal_errors = false;
+    policy.on_error = [&](const kale::Context &, const kale::ErrorEvent &ev) {
+        obs_status = ev.status_code;
+        obs_source = std::string(ev.source);
+        obs_reason = std::string(ev.reason);
+        obs_message = std::string(ev.message);
+        obs_req_id = std::string(ev.request_id);
+        obs_exposed = ev.is_exposed;
+        obs_has_exception = static_cast<bool>(ev.exception);
+        if (ev.internal_details) {
+            auto it = ev.internal_details->find("db_host");
+            if (it != ev.internal_details->end()) {
+                obs_internal_secret = it->second;
+            }
+        }
+    };
+
+    SUBCASE("standard_json_error_formatter redacts 5xx and hides internal_details") {
+        static_assert(!HasRawException<kale::ErrorContext>);
+        static_assert(!HasException<kale::ErrorContext>);
+
+        kale::HttpServerParams params;
+        params.set_error_formatter(kale::standard_json_error_formatter);
+        params.set_error_policy(policy);
+
+        FeatureErrorServer server(params);
+        kale::RequestIdConfig id_cfg;
+        id_cfg.generator = [] { return std::string("obs-req-1"); };
+        server->use(kale::request_id(id_cfg));
+        server->GET("/db-fail", [](kale::Context &) {
+            auto err = kale::HttpError::internal_error("raw sql syntax error near users", "DB_ERROR", false);
+            err.with_diagnostic("storage", "query_failed")
+               .with_internal_detail("db_host", "10.0.0.42");
+            throw err;
+        });
+        server.start();
+
+        auto res = server.request("/db-fail");
+        CHECK(res.status == 500);
+        CHECK(res.body.find("raw sql syntax error") == std::string::npos);
+        CHECK(res.body.find("10.0.0.42") == std::string::npos);
+        CHECK(res.body.find("db_host") == std::string::npos);
+        CHECK(res.body.find("Internal Server Error") != std::string::npos);
+
+        CHECK(obs_status == 500);
+        CHECK(obs_source == "storage");
+        CHECK(obs_reason == "query_failed");
+        CHECK(obs_message == "raw sql syntax error near users");
+        CHECK(obs_req_id == "obs-req-1");
+        CHECK(obs_exposed == false);
+        CHECK(obs_internal_secret == "10.0.0.42");
+        CHECK(obs_has_exception);
+    }
+
+    SUBCASE("problem_details_error_formatter renders exposed 4xx without leaking internal_details") {
+        kale::HttpServerParams params;
+        params.set_error_formatter(kale::problem_details_error_formatter);
+        params.set_error_policy(policy);
+
+        FeatureErrorServer server(params);
+        server->GET("/forbidden-item", [](kale::Context &) {
+            auto err = kale::HttpError::forbidden("access denied", "ACCESS_DENIED");
+            err.with_diagnostic("acl", "policy_denied")
+               .with_internal_detail("db_host", "internal-only-val");
+            throw err;
+        });
+        server.start();
+
+        auto res = server.request("/forbidden-item");
+        CHECK(res.status == 403);
+        CHECK(res.body.find("access denied") != std::string::npos);
+        CHECK(res.body.find("ACCESS_DENIED") != std::string::npos);
+        CHECK(res.body.find("internal-only-val") == std::string::npos);
+        CHECK(res.body.find("db_host") == std::string::npos);
+        CHECK(obs_status == 403);
+        CHECK(obs_source == "acl");
+        CHECK(obs_reason == "policy_denied");
+        CHECK(obs_exposed == true);
+        CHECK(obs_internal_secret == "internal-only-val");
+        CHECK(obs_has_exception);
+    }
+}
+
+TEST_CASE("Throwing from ErrorPolicy::on_error is isolated and preserves HTTP error response") {
+    kale::HttpServerParams params;
+    params.set_error_formatter(kale::standard_json_error_formatter);
+    kale::ErrorPolicy policy;
+    policy.on_error = [](const kale::Context &, const kale::ErrorEvent &) {
+        throw std::runtime_error("observer crashed");
+    };
+    params.set_error_policy(policy);
+
+    FeatureErrorServer server(params);
+    server->GET("/oops", [](kale::Context &) {
+        throw kale::HttpError::bad_request("bad payload", "BAD_PAYLOAD");
+    });
+    server.start();
+
+    auto res = server.request("/oops");
+    CHECK(res.status == 400);
+    CHECK(res.body.find("BAD_PAYLOAD") != std::string::npos);
+}
+
+TEST_CASE("Pre-route path traversal 403 invokes server ErrorPolicy::on_error") {
+    std::string obs_source;
+    std::string obs_reason;
+    int obs_status = 0;
+
+    kale::HttpServerParams params;
+    kale::ErrorPolicy policy;
+    policy.on_error = [&](const kale::Context &, const kale::ErrorEvent &ev) {
+        obs_status = ev.status_code;
+        obs_source = std::string(ev.source);
+        obs_reason = std::string(ev.reason);
+    };
+    params.set_error_policy(policy);
+
+    FeatureErrorServer server(params);
+    server->GET("/files/:name", [](kale::Context &ctx) {
+        ctx.string("ok");
+    });
+    server.start();
+
+    auto res = server.request("/files/../secret");
+    CHECK(res.status == 403);
+    CHECK(obs_status == 403);
+    CHECK(obs_source == "http_server");
+    CHECK(obs_reason == "path_traversal");
 }

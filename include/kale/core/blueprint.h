@@ -1,9 +1,11 @@
 #ifndef KALE_BLUEPRINT_H
 #define KALE_BLUEPRINT_H
 
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <string>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -21,6 +23,7 @@ public:
         HttpMethod method{HttpMethod::GET};
         std::string path;
         RouteEndpoint endpoint;
+        bool has_max_body_size{false};
     };
 
     struct ChildMount;
@@ -71,14 +74,20 @@ public:
 
         RouteBuilder &max_body_size(size_t limit) & {
             for (auto *d : decls_) {
-                if (d) d->endpoint.max_body_size = limit;
+                if (d) {
+                    d->endpoint.max_body_size = limit;
+                    d->has_max_body_size = true;
+                }
             }
             return *this;
         }
 
         RouteBuilder &&max_body_size(size_t limit) && {
             for (auto *d : decls_) {
-                if (d) d->endpoint.max_body_size = limit;
+                if (d) {
+                    d->endpoint.max_body_size = limit;
+                    d->has_max_body_size = true;
+                }
             }
             return std::move(*this);
         }
@@ -349,6 +358,16 @@ public:
         return std::move(*this);
     }
 
+    Blueprint &max_body_size(size_t limit) & {
+        max_body_size_ = limit;
+        return *this;
+    }
+
+    Blueprint &&max_body_size(size_t limit) && {
+        max_body_size_ = limit;
+        return std::move(*this);
+    }
+
     Blueprint &mount(std::string_view prefix, Blueprint blueprint) &;
     Blueprint &&mount(std::string_view prefix, Blueprint blueprint) &&;
 
@@ -371,10 +390,13 @@ public:
     const std::vector<ChildMount> &children() const noexcept { return children_; }
     std::vector<ChildMount> &children() noexcept { return children_; }
 
+    std::optional<size_t> max_body_size() const noexcept { return max_body_size_; }
+
     void register_into(Router &router,
                        std::string_view current_prefix,
                        const std::vector<Middleware> &parent_mws = {},
-                       const std::map<std::string, std::string, std::less<>> &parent_tags = {}) const;
+                       const std::map<std::string, std::string, std::less<>> &parent_tags = {},
+                       std::optional<size_t> parent_max_body_size = std::nullopt) const;
 
 private:
     RouteDeclaration *add_route_internal(HttpMethod method, std::string path, Handler handler, std::vector<Middleware> middlewares) {
@@ -426,6 +448,7 @@ private:
     std::vector<Middleware> middlewares_;
     std::map<std::string, std::string, std::less<>> tags_;
     std::vector<ChildMount> children_;
+    std::optional<size_t> max_body_size_;
 };
 
 struct Blueprint::ChildMount {
@@ -459,7 +482,8 @@ inline Blueprint &Blueprint::operator=(Blueprint &&) noexcept = default;
 inline Blueprint::Blueprint(const Blueprint &other)
     : middlewares_(other.middlewares_),
       tags_(other.tags_),
-      children_(other.children_) {
+      children_(other.children_),
+      max_body_size_(other.max_body_size_) {
     routes_.reserve(other.routes_.size());
     for (const auto &r : other.routes_) {
         if (r) {
@@ -473,6 +497,7 @@ inline Blueprint &Blueprint::operator=(const Blueprint &other) {
         middlewares_ = other.middlewares_;
         tags_ = other.tags_;
         children_ = other.children_;
+        max_body_size_ = other.max_body_size_;
         routes_.clear();
         routes_.reserve(other.routes_.size());
         for (const auto &r : other.routes_) {

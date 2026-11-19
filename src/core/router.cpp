@@ -1,6 +1,8 @@
 #include "kale/core/router.h"
 #include <stdexcept>
 #include "kale/core/http_util.h"
+#include "kale/core/error_response.h"
+#include "kale/core/http_error.h"
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
@@ -66,6 +68,7 @@ struct PipelineRunner {
     const std::vector<Middleware> &route_mws;
     Context &ctx;
     const Handler &final_handler;
+    size_t max_body_size{0};
     struct Continuation {
         PipelineRunner &runner;
         size_t index;
@@ -79,6 +82,10 @@ struct PipelineRunner {
     };
     coke::Task<void> step(size_t index) {
         const size_t global_size = global_mws.size();
+        if (index == global_size && max_body_size > 0 && ctx.req_body().size() > max_body_size) {
+            reply_payload_too_large(ctx, max_body_size);
+            co_return;
+        }
         if (index < global_size + route_mws.size()) {
             Continuation continuation{*this, index + 1};
             Next next(continuation);
@@ -96,12 +103,25 @@ struct PipelineRunner {
 
 } // namespace
 
+void reply_payload_too_large(Context &ctx, size_t limit_bytes) {
+    auto err = HttpError::payload_too_large("Payload Too Large", "PAYLOAD_TOO_LARGE");
+    err.with_diagnostic("http_server", "body_too_large")
+       .with_internal_detail("limit_bytes", std::to_string(limit_bytes))
+       .with_internal_detail("actual_bytes", std::to_string(ctx.req_body().size()));
+    reply_error(ctx, err);
+}
+
 coke::Task<void> compose_and_run(
     const std::vector<Middleware> &global_mws,
     const std::vector<Middleware> &route_mws,
     Context &ctx,
-    const Handler &final_handler) {
+    const Handler &final_handler,
+    size_t max_body_size) {
     if (global_mws.empty() && route_mws.empty()) {
+        if (max_body_size > 0 && ctx.req_body().size() > max_body_size) {
+            reply_payload_too_large(ctx, max_body_size);
+            co_return;
+        }
         if (final_handler.is_sync()) {
             final_handler.invoke_sync(ctx);
             co_return;
@@ -112,7 +132,7 @@ coke::Task<void> compose_and_run(
         co_return;
     }
 
-    PipelineRunner runner{global_mws, route_mws, ctx, final_handler};
+    PipelineRunner runner{global_mws, route_mws, ctx, final_handler, max_body_size};
     co_await runner.step(0);
 }
 

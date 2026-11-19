@@ -200,6 +200,8 @@ const char* to_string(JwtError err) noexcept {
         case JwtError::UnsupportedHeaderParameter: return "unsupported_header_parameter";
         case JwtError::TypeMismatch: return "type_mismatch";
         case JwtError::KidMismatch: return "kid_mismatch";
+        case JwtError::TokenRejected: return "token_rejected";
+        case JwtError::MissingToken: return "missing_token";
     }
     return "unknown_error";
 }
@@ -1126,9 +1128,84 @@ const VerifiedJwtClaims* get_jwt_claims(const Context &ctx) noexcept {
     return ctx.get_attachment<VerifiedJwtClaims>();
 }
 
+namespace {
+
+std::string escape_bearer_realm(std::string_view realm) {
+    std::string out;
+    out.reserve(realm.size() + 2);
+    for (char c : realm) {
+        if (c == '"' || c == '\\') {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+std::string build_bearer_challenge(std::string_view realm, bool include_error) {
+    std::string val = "Bearer";
+    if (!realm.empty()) {
+        val += " realm=\"";
+        val += escape_bearer_realm(realm);
+        val.push_back('"');
+        if (include_error) {
+            val += ", error=\"invalid_token\"";
+        }
+    } else if (include_error) {
+        val += " error=\"invalid_token\"";
+    }
+    return val;
+}
+
+bool is_http_tchar(unsigned char c) noexcept {
+    if (c <= 32 || c >= 127) {
+        return false;
+    }
+    switch (c) {
+        case '(': case ')': case '<': case '>': case '@':
+        case ',': case ';': case ':': case '\\': case '"':
+        case '/': case '[': case ']': case '?': case '=':
+        case '{': case '}':
+            return false;
+        default:
+            return true;
+    }
+}
+
+bool is_valid_bearer_token(std::string_view token) noexcept {
+    if (token.empty()) {
+        return false;
+    }
+    size_t i = 0;
+    while (i < token.size()) {
+        const unsigned char c = static_cast<unsigned char>(token[i]);
+        const bool is_b64_char =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '.' || c == '_' || c == '~' || c == '+' || c == '/';
+        if (!is_b64_char) {
+            break;
+        }
+        ++i;
+    }
+    if (i == 0) {
+        return false;
+    }
+    for (; i < token.size(); ++i) {
+        if (token[i] != '=') {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 Middleware bearer_auth(BearerAuthConfig config) {
-    if (config.secret_or_public_key.empty() && !config.key_resolver) {
-        throw std::invalid_argument("BearerAuth: secret_or_public_key or key_resolver must be provided");
+    const bool opaque_mode = static_cast<bool>(config.token_verifier);
+    if (!opaque_mode && config.secret_or_public_key.empty() && !config.key_resolver) {
+        throw std::invalid_argument("BearerAuth: secret_or_public_key, key_resolver, or token_verifier must be provided");
     }
     if (config.header_name.empty()) {
         throw std::invalid_argument("BearerAuth: header_name must not be empty");
@@ -1137,7 +1214,13 @@ Middleware bearer_auth(BearerAuthConfig config) {
         throw std::invalid_argument("BearerAuth: header_prefix must not be empty");
     }
 
-    return [cfg = std::move(config)](Context &ctx, Next next) -> coke::Task<void> {
+    std::string plain_challenge = build_bearer_challenge(config.realm, false);
+    std::string invalid_token_challenge = build_bearer_challenge(config.realm, true);
+
+    return [cfg = std::move(config),
+            opaque_mode,
+            plain_challenge = std::move(plain_challenge),
+            invalid_token_challenge = std::move(invalid_token_challenge)](Context &ctx, Next next) -> coke::Task<void> {
         // Skip paths
         for (const auto &skip : cfg.skip_paths) {
             if (ctx.path() == skip) {
@@ -1146,65 +1229,108 @@ Middleware bearer_auth(BearerAuthConfig config) {
             }
         }
 
-        // Enumerate headers with cursor to detect duplicate Authorization headers
+        // Enumerate headers with cursor to detect duplicate Authorization headers without allocating
         int auth_header_count = 0;
-        std::string raw_auth_header;
+        std::string_view raw_auth_header;
         protocol::HttpHeaderCursor cursor(&ctx.raw_req());
-        std::string hname, hval;
-        while (cursor.next(hname, hval)) {
+        protocol::HttpMessageHeader hdr{};
+        while (cursor.next(&hdr)) {
+            std::string_view hname = hdr.name
+                ? std::string_view(static_cast<const char *>(hdr.name), hdr.name_len)
+                : std::string_view{};
             if (case_insensitive_equal(hname, cfg.header_name)) {
-                auth_header_count++;
+                ++auth_header_count;
                 if (auth_header_count == 1) {
-                    raw_auth_header = hval;
+                    raw_auth_header = hdr.value
+                        ? std::string_view(static_cast<const char *>(hdr.value), hdr.value_len)
+                        : std::string_view{};
+                } else {
+                    break;
                 }
             }
         }
 
-        auto handle_unauthorized = [&](JwtError err) {
+        auto handle_unauthorized = [&](JwtError err, bool include_error) {
+            const std::string &challenge = include_error ? invalid_token_challenge : plain_challenge;
             if (cfg.on_unauthorized) {
                 ctx.set_status(HttpStatus::Unauthorized);
-                ctx.set_header("WWW-Authenticate", "Bearer error=\"invalid_token\"");
+                ctx.set_header("WWW-Authenticate", challenge);
                 cfg.on_unauthorized(ctx, err);
             } else {
-                auto http_err = HttpError::unauthorized("Unauthorized", "INVALID_TOKEN", cfg.realm);
-                if (cfg.realm.empty()) {
-                    http_err.with_header("WWW-Authenticate", "Bearer error=\"invalid_token\"");
-                } else {
-                    std::string auth_val = "Bearer realm=\"";
-                    for (char c : cfg.realm) {
-                        if (c == '"' || c == '\\') auth_val.push_back('\\');
-                        auth_val.push_back(c);
-                    }
-                    auth_val += "\", error=\"invalid_token\"";
-                    http_err.with_header("WWW-Authenticate", std::move(auth_val));
-                }
+                auto http_err = HttpError(
+                    HttpStatus::Unauthorized,
+                    "Unauthorized",
+                    include_error ? "INVALID_TOKEN" : "UNAUTHORIZED",
+                    true);
+                http_err.with_header("WWW-Authenticate", challenge);
+                http_err.with_diagnostic("bearer_auth", to_string(err));
                 reply_error(ctx, http_err);
             }
         };
 
-        if (auth_header_count != 1 || raw_auth_header.empty()) {
-            handle_unauthorized(JwtError::MalformedToken);
+        if (auth_header_count == 0) {
+            handle_unauthorized(JwtError::MissingToken, false);
+            co_return;
+        }
+        if (auth_header_count > 1 || raw_auth_header.empty()) {
+            handle_unauthorized(JwtError::MalformedToken, true);
             co_return;
         }
 
-        std::string_view prefix = cfg.header_prefix;
-        if (raw_auth_header.size() <= prefix.size()) {
-            handle_unauthorized(JwtError::MalformedToken);
+        const std::string_view prefix = cfg.header_prefix;
+        std::string_view scheme = prefix;
+        while (!scheme.empty() && scheme.back() == ' ') {
+            scheme.remove_suffix(1);
+        }
+
+        const bool prefix_ends_with_tchar =
+            !prefix.empty() && is_http_tchar(static_cast<unsigned char>(prefix.back()));
+        const bool matches_prefix =
+            raw_auth_header.size() >= prefix.size() &&
+            case_insensitive_equal(raw_auth_header.substr(0, prefix.size()), prefix) &&
+            (!prefix_ends_with_tchar ||
+             raw_auth_header.size() == prefix.size() ||
+             !is_http_tchar(static_cast<unsigned char>(raw_auth_header[prefix.size()])));
+
+        if (!matches_prefix) {
+            const bool whitespace_only =
+                raw_auth_header.find_first_not_of(" \t") == std::string_view::npos;
+            const bool is_malformed_matching_scheme =
+                !scheme.empty() &&
+                raw_auth_header.size() >= scheme.size() &&
+                case_insensitive_equal(raw_auth_header.substr(0, scheme.size()), scheme) &&
+                (raw_auth_header.size() == scheme.size() ||
+                 !is_http_tchar(static_cast<unsigned char>(raw_auth_header[scheme.size()])));
+
+            if (whitespace_only || is_malformed_matching_scheme) {
+                handle_unauthorized(JwtError::MalformedToken, true);
+            } else {
+                handle_unauthorized(JwtError::MissingToken, false);
+            }
             co_return;
         }
 
-        std::string_view actual_prefix = std::string_view(raw_auth_header).substr(0, prefix.size());
-        if (!case_insensitive_equal(actual_prefix, prefix)) {
-            handle_unauthorized(JwtError::MalformedToken);
-            co_return;
-        }
-
-        std::string_view token = std::string_view(raw_auth_header).substr(prefix.size());
+        std::string_view token = raw_auth_header.substr(prefix.size());
         while (!token.empty() && token.front() == ' ') token.remove_prefix(1);
         while (!token.empty() && token.back() == ' ') token.remove_suffix(1);
 
+        if (opaque_mode) {
+            if (!is_valid_bearer_token(token)) {
+                handle_unauthorized(JwtError::MalformedToken, true);
+                co_return;
+            }
+
+            if (!cfg.token_verifier(ctx, token)) {
+                handle_unauthorized(JwtError::TokenRejected, true);
+                co_return;
+            }
+
+            co_await next();
+            co_return;
+        }
+
         if (token.empty() || token.find(',') != std::string_view::npos || token.find(' ') != std::string_view::npos) {
-            handle_unauthorized(JwtError::MalformedToken);
+            handle_unauthorized(JwtError::MalformedToken, true);
             co_return;
         }
 
@@ -1218,7 +1344,7 @@ Middleware bearer_auth(BearerAuthConfig config) {
         }
 
         if (!res) {
-            handle_unauthorized(res.error);
+            handle_unauthorized(res.error, true);
             co_return;
         }
 

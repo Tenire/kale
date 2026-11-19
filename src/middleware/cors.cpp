@@ -226,15 +226,23 @@ Middleware cors(CorsConfig config) {
         if (preflight) {
             std::string_view method;
             std::string headers;
-            bool permitted = allowed && single_header(ctx, "Access-Control-Request-Method", method) &&
-                is_valid_header_name(method) &&
-                std::find(config.allow_methods.begin(), config.allow_methods.end(), method) != config.allow_methods.end();
-            if (permitted && ctx.has_header("Access-Control-Request-Headers")) {
+            std::string_view deny_reason;
+            if (!allowed) {
+                deny_reason = "preflight_origin_denied";
+            } else if (!single_header(ctx, "Access-Control-Request-Method", method) ||
+                       !is_valid_header_name(method) ||
+                       std::find(config.allow_methods.begin(), config.allow_methods.end(), method) == config.allow_methods.end()) {
+                deny_reason = "preflight_method_denied";
+            } else if (ctx.has_header("Access-Control-Request-Headers")) {
                 const auto requested = ctx.header("Access-Control-Request-Headers");
-                permitted = allowed_headers(requested, config, headers);
+                if (!allowed_headers(requested, config, headers)) {
+                    deny_reason = "preflight_header_denied";
+                }
             }
-            if (!permitted) {
-                reply_error(ctx, HttpError::forbidden("CORS origin not allowed", "CORS_FORBIDDEN"));
+            if (!deny_reason.empty()) {
+                auto err = HttpError::forbidden("CORS origin not allowed", "CORS_FORBIDDEN");
+                err.with_diagnostic("cors", std::string(deny_reason));
+                reply_error(ctx, err);
                 co_return;
             }
             set_grants(ctx, config, origin, {});

@@ -76,7 +76,8 @@ void Blueprint::register_into(
     Router &router,
     std::string_view current_prefix,
     const std::vector<Middleware> &parent_mws,
-    const std::map<std::string, std::string, std::less<>> &parent_tags) const
+    const std::map<std::string, std::string, std::less<>> &parent_tags,
+    std::optional<size_t> parent_max_body_size) const
 {
     std::string norm_prefix = normalize_prefix(current_prefix);
 
@@ -90,7 +91,11 @@ void Blueprint::register_into(
         combined_tags[k] = v;
     }
 
+    const std::optional<size_t> effective_group_max_body_size =
+        max_body_size_.has_value() ? max_body_size_ : parent_max_body_size;
+
     for (const auto &decl : routes_) {
+        if (!decl) continue;
         std::string full_path = join_route_path(norm_prefix, decl->path);
 
         std::vector<Middleware> route_final_mws;
@@ -121,15 +126,23 @@ void Blueprint::register_into(
             builder.tag(k, std::move(v));
         }
 
-        if (decl->endpoint.max_body_size > 0) {
-            builder.max_body_size(decl->endpoint.max_body_size);
+        size_t effective_max_body_size = 0;
+        if (decl->has_max_body_size || decl->endpoint.max_body_size > 0) {
+            effective_max_body_size = decl->endpoint.max_body_size;
+        } else if (effective_group_max_body_size.has_value()) {
+            effective_max_body_size = *effective_group_max_body_size;
+        }
+
+        if (effective_max_body_size > 0) {
+            builder.max_body_size(effective_max_body_size);
         }
     }
 
     for (const auto &child : children_) {
         if (child.blueprint) {
             std::string next_prefix = join_prefix(norm_prefix, child.prefix);
-            child.blueprint->register_into(router, next_prefix, combined_mws, combined_tags);
+            child.blueprint->register_into(
+                router, next_prefix, combined_mws, combined_tags, effective_group_max_body_size);
         }
     }
 }

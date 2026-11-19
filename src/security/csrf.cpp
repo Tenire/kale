@@ -230,9 +230,20 @@ Middleware csrf(CsrfConfig config) {
             }
         }
 
-        auto handle_forbidden = [&]() {
-            reply_error(ctx, HttpError::forbidden("Invalid or missing CSRF token", "CSRF_FAILED"));
+        auto handle_forbidden = [&](std::string_view reason, std::string_view origin = {}) {
+            const std::string_view msg = (cfg.mode == CsrfMode::OriginOnly)
+                ? "CSRF origin check failed"
+                : "Invalid or missing CSRF token";
+            auto err = HttpError::forbidden(std::string(msg), "CSRF_FAILED");
+            err.with_diagnostic("csrf", std::string(reason));
+            if (!origin.empty()) {
+                err.with_internal_detail("origin", std::string(origin));
+            }
+            reply_error(ctx, err);
         };
+
+        std::string_view fail_reason;
+        std::string fail_origin;
 
         bool is_safe = false;
         for (const auto &m : cfg.safe_methods) {
@@ -274,26 +285,33 @@ Middleware csrf(CsrfConfig config) {
 
         auto verify_origin = [&]() -> bool {
             if (origin_count > 1) {
+                fail_reason = "origin_duplicate";
                 return false;
             }
             std::string_view candidate_hdr;
+            bool used_referer = false;
             if (origin_count == 1 && !trim_ows(origin_hdr).empty()) {
                 candidate_hdr = origin_hdr;
             } else if (origin_count == 0 && cfg.allow_referer_fallback) {
                 if (referer_count > 1) {
+                    fail_reason = "origin_duplicate";
                     return false;
                 }
                 if (referer_count == 1 && !trim_ows(referer_hdr).empty()) {
                     candidate_hdr = referer_hdr;
+                    used_referer = true;
                 } else {
+                    fail_reason = "origin_missing";
                     return false;
                 }
             } else {
+                fail_reason = "origin_missing";
                 return false;
             }
 
             std::string cand_norm = extract_scheme_and_authority(candidate_hdr);
             if (cand_norm.empty()) {
+                fail_reason = "origin_malformed";
                 return false;
             }
 
@@ -318,21 +336,34 @@ Middleware csrf(CsrfConfig config) {
                         return true;
                     }
                 }
+                fail_reason = used_referer ? "referer_untrusted" : "origin_untrusted";
+                fail_origin = std::move(cand_norm);
                 return false;
             }
 
             std::string host_auth = extract_authority_only(ctx.header_view("Host"));
             std::string cand_auth = extract_authority_only(cand_norm);
-            return !host_auth.empty() && cand_auth == host_auth;
+            if (host_auth.empty() || cand_auth != host_auth) {
+                fail_reason = used_referer ? "referer_untrusted" : "origin_untrusted";
+                fail_origin = std::move(cand_norm);
+                return false;
+            }
+            return true;
         };
 
         auto verify_double_submit_token = [&]() -> bool {
+            if (cookie_tokens.empty()) {
+                fail_reason = "cookie_missing";
+                return false;
+            }
             if (cookie_tokens.size() != 1 || !verify_csrf_token(cookie_tokens[0], cfg.secret)) {
+                fail_reason = "cookie_invalid";
                 return false;
             }
             const std::string &cookie_token = cookie_tokens[0];
 
             if (csrf_header_count > 1) {
+                fail_reason = "header_form_conflict";
                 return false;
             }
 
@@ -351,6 +382,7 @@ Middleware csrf(CsrfConfig config) {
             std::string submitted_token;
             if (csrf_header_count == 1 && has_form_token) {
                 if (submitted_header_token != form_token) {
+                    fail_reason = "header_form_conflict";
                     return false;
                 }
                 submitted_token = submitted_header_token;
@@ -359,19 +391,24 @@ Middleware csrf(CsrfConfig config) {
             } else if (has_form_token) {
                 submitted_token = form_token;
             } else {
+                fail_reason = "token_missing";
                 return false;
             }
 
-            return !submitted_token.empty() &&
-                   verify_csrf_token(submitted_token, cfg.secret) &&
-                   CryptoUtil::constant_time_equals(submitted_token, cookie_token);
+            if (submitted_token.empty() ||
+                !verify_csrf_token(submitted_token, cfg.secret) ||
+                !CryptoUtil::constant_time_equals(submitted_token, cookie_token)) {
+                fail_reason = "token_mismatch";
+                return false;
+            }
+            return true;
         };
 
         bool has_origin_policy = !cfg.trusted_origins.empty() || static_cast<bool>(cfg.trusted_origin_resolver);
 
         if (cfg.mode == CsrfMode::OriginOnly) {
             if (!verify_origin()) {
-                handle_forbidden();
+                handle_forbidden(fail_reason, fail_origin);
                 co_return;
             }
             co_await next();
@@ -383,17 +420,17 @@ Middleware csrf(CsrfConfig config) {
                 co_await next();
                 co_return;
             }
-            handle_forbidden();
+            handle_forbidden(fail_reason, fail_origin);
             co_return;
         }
 
         // CsrfMode::TokenRequired
         if (has_origin_policy && !verify_origin()) {
-            handle_forbidden();
+            handle_forbidden(fail_reason, fail_origin);
             co_return;
         }
         if (!verify_double_submit_token()) {
-            handle_forbidden();
+            handle_forbidden(fail_reason, fail_origin);
             co_return;
         }
 

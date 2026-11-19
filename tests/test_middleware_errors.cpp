@@ -12,6 +12,8 @@
 #include "kale/core/http_error.h"
 #include "kale/core/http_server.h"
 #include "kale/core/http_util.h"
+#include "kale/middleware/access_log.h"
+#include "kale/middleware/request_id.h"
 #include "kale/middleware/cors.h"
 #include "kale/middleware/error_handler.h"
 #include "kale/middleware/rate_limiter.h"
@@ -165,7 +167,7 @@ TEST_CASE("Middleware error adoption: bearer_auth rejection emits 401 with realm
     CHECK(res.status == 401);
     CHECK(res.has("WWW-Authenticate"));
     CHECK(res.header("WWW-Authenticate").find("realm=\"api_gateway_realm\"") != std::string::npos);
-    CHECK(res.body.find("INVALID_TOKEN") != std::string::npos);
+    CHECK(res.body.find("UNAUTHORIZED") != std::string::npos);
 }
 
 TEST_CASE("Middleware error adoption: csrf rejection emits 403 on state-changing method") {
@@ -201,4 +203,61 @@ TEST_CASE("Middleware error_handler centralized recovery formats JSON") {
     CHECK(res.body.find("\"code\":409") != std::string::npos);
     CHECK(res.body.find("\"error_code\":\"CONFLICT_KEY\"") != std::string::npos);
     CHECK(res.body.find("\"message\":\"Resource conflict detected\"") != std::string::npos);
+}
+
+TEST_CASE("Route max_body_size 413 flows through global middlewares and blocks route-local middleware/handler") {
+    bool route_mw_called = false;
+    bool handler_called = false;
+    int logged_status = 0;
+    std::string obs_source;
+    std::string obs_reason;
+    std::string obs_limit;
+    std::string obs_actual;
+
+    kale::ErrorPolicy policy;
+    policy.on_error = [&](const kale::Context &, const kale::ErrorEvent &ev) {
+        obs_source = std::string(ev.source);
+        obs_reason = std::string(ev.reason);
+        if (ev.internal_details) {
+            if (auto it = ev.internal_details->find("limit_bytes"); it != ev.internal_details->end()) {
+                obs_limit = it->second;
+            }
+            if (auto it = ev.internal_details->find("actual_bytes"); it != ev.internal_details->end()) {
+                obs_actual = it->second;
+            }
+        }
+    };
+
+    MiddlewareErrorServer server;
+    kale::RequestIdConfig id_cfg;
+    id_cfg.generator = [] { return std::string("body-limit-req-1"); };
+    server->use(kale::request_id(id_cfg));
+
+    server->use(kale::access_log([&](kale::AccessLogRecord rec) {
+        logged_status = rec.status_code;
+    }));
+    server->use(kale::error_handler(kale::ErrorFormatters::standard_json(), policy));
+
+    auto route_mw = [&](kale::Context &, kale::Next next) -> coke::Task<void> {
+        route_mw_called = true;
+        co_await next();
+    };
+    server->POST("/upload", route_mw, [&](kale::Context &ctx) {
+        handler_called = true;
+        ctx.string("ok");
+    }).max_body_size(5);
+    server.start();
+
+    auto res = server.request("/upload", "POST", {}, "0123456789");
+    CHECK(res.status == 413);
+    CHECK(res.has("X-Request-Id"));
+    CHECK(res.header("X-Request-Id") == "body-limit-req-1");
+    CHECK(res.body.find("PAYLOAD_TOO_LARGE") != std::string::npos);
+    CHECK(logged_status == 413);
+    CHECK_FALSE(route_mw_called);
+    CHECK_FALSE(handler_called);
+    CHECK(obs_source == "http_server");
+    CHECK(obs_reason == "body_too_large");
+    CHECK(obs_limit == "5");
+    CHECK(obs_actual == "10");
 }

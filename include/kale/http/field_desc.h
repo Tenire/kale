@@ -48,7 +48,7 @@ template <typename Class, typename Member, typename... Rules>
 struct FieldDesc {
     std::string_view key;
     Member Class::*member;
-    std::tuple<Rules...> rules{};
+    std::tuple<Rules...> rules;
 
     using class_type = Class;
     using member_type = Member;

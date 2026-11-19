@@ -25,6 +25,7 @@
 #include "kale/core/http_server.h"
 #include "kale/core/context.h"
 #include "kale/http/json.h"
+#include "kale/core/blueprint.h"
 #include "kale/core/router.h"
 #include "kale/http/sse.h"
 #include "kale/security/signed_cookie.h"
@@ -4366,5 +4367,227 @@ TEST_CASE("HttpServer presets 404 and 405 before custom fallback handlers") {
         CHECK_EQ(spa_res.status, 200);
         CHECK_EQ(spa_res.body, "spa index");
     }
+}
+
+TEST_CASE("Blueprint max_body_size inheritance, overrides, and HTTP short-circuit") {
+    static_assert(std::is_same_v<decltype(std::declval<kale::Blueprint &>().max_body_size(10)), kale::Blueprint &>);
+    static_assert(std::is_same_v<decltype(std::declval<kale::Blueprint &&>().max_body_size(10)), kale::Blueprint &&>);
+    static_assert(std::is_same_v<decltype(std::declval<kale::Blueprint::RouteBuilder &>().max_body_size(10)),
+                                 kale::Blueprint::RouteBuilder &>);
+    static_assert(std::is_same_v<decltype(std::declval<kale::Blueprint::RouteBuilder &&>().max_body_size(10)),
+                                 kale::Blueprint::RouteBuilder &&>);
+    static_assert(std::is_aggregate_v<kale::Blueprint::RouteDeclaration>);
+
+    kale::Blueprint::RouteDeclaration agg_decl{kale::HttpMethod::POST, "/agg", kale::RouteEndpoint{}};
+    CHECK_FALSE(agg_decl.has_max_body_size);
+
+    kale::Blueprint unset_bp;
+    CHECK_FALSE(unset_bp.max_body_size().has_value());
+    unset_bp.POST("/local_only", [](kale::Context &) {}).max_body_size(7);
+    CHECK_FALSE(unset_bp.max_body_size().has_value());
+    unset_bp.routes().clear();
+
+    kale::Blueprint zero_bp;
+    zero_bp.max_body_size(0);
+    REQUIRE(zero_bp.max_body_size().has_value());
+    CHECK_EQ(*zero_bp.max_body_size(), 0);
+
+    kale::Blueprint copied_zero(zero_bp);
+    REQUIRE(copied_zero.max_body_size().has_value());
+    CHECK_EQ(*copied_zero.max_body_size(), 0);
+    copied_zero = unset_bp;
+    CHECK_FALSE(copied_zero.max_body_size().has_value());
+
+    kale::Blueprint moved_zero(std::move(zero_bp));
+    REQUIRE(moved_zero.max_body_size().has_value());
+    CHECK_EQ(*moved_zero.max_body_size(), 0);
+    kale::Blueprint move_assigned;
+    move_assigned = std::move(moved_zero);
+    REQUIRE(move_assigned.max_body_size().has_value());
+    CHECK_EQ(*move_assigned.max_body_size(), 0);
+
+    CoreTestServer server;
+    std::atomic<int> global_mw_calls{0};
+    std::atomic<int> group_mw_calls{0};
+    std::atomic<int> handler_calls{0};
+
+    server->use([&global_mw_calls](kale::Context &, kale::Next next) -> coke::Task<void> {
+        global_mw_calls.fetch_add(1);
+        co_await next();
+    });
+
+    auto echo_len = [&handler_calls](kale::Context &ctx) {
+        handler_calls.fetch_add(1);
+        ctx.string(std::to_string(ctx.req_body().size()));
+    };
+
+    kale::Blueprint root;
+    root.use([&group_mw_calls](kale::Context &, kale::Next next) -> coke::Task<void> {
+        group_mw_calls.fetch_add(1);
+        co_await next();
+    });
+
+    // Declared before root.max_body_size(10)
+    root.POST("/inherited_before", echo_len);
+    root.POST("/explicit_zero_before", echo_len).max_body_size(0);
+    root.GET("/overload", echo_len);
+    root.POST("/overload", echo_len).max_body_size(4);
+    root.PUT("/overload", echo_len).max_body_size(0);
+    root.any("/any_capped", echo_len).max_body_size(5);
+    root.any("/any_zero", echo_len).max_body_size(0);
+
+    auto prog_decl = std::make_unique<kale::Blueprint::RouteDeclaration>();
+    prog_decl->method = kale::HttpMethod::POST;
+    prog_decl->path = "/programmatic";
+    prog_decl->endpoint.handler = kale::make_handler(echo_len);
+    prog_decl->endpoint.max_body_size = 12;
+    root.routes().push_back(std::move(prog_decl));
+
+    kale::Blueprint nearest_child;
+    nearest_child.POST("/data", echo_len);
+    nearest_child.max_body_size(20);
+
+    kale::Blueprint leaf_under_zero;
+    leaf_under_zero.POST("/open", echo_len);
+    leaf_under_zero.POST("/capped", echo_len).max_body_size(6);
+
+    kale::Blueprint zero_child;
+    zero_child.mount("/leaf", std::move(leaf_under_zero));
+    zero_child.POST("/open", echo_len);
+    zero_child.max_body_size(0);
+
+    kale::Blueprint unset_child;
+    unset_child.POST("/inherited", echo_len);
+
+    root.mount("/nearest", std::move(nearest_child));
+    root.mount("/zero", std::move(zero_child));
+    root.mount("/unset", std::move(unset_child));
+    root.max_body_size(10);
+
+    // Declared after root.max_body_size(10); route-builder max_body_size remains route-local
+    root.POST("/inherited_after", echo_len);
+    root.POST("/explicit_zero_after", echo_len).max_body_size(0);
+    root.POST("/route_local_only", echo_len).max_body_size(7);
+    CHECK_EQ(*root.max_body_size(), 10);
+
+    kale::Blueprint root_copy = root;
+    server->mount("/api", std::move(root_copy));
+    server->mount("/rval",
+        kale::Blueprint().max_body_size(8).POST("/inherit", echo_len).POST("/local", echo_len).max_body_size(14));
+
+    std::map<std::pair<kale::HttpMethod, std::string>, size_t> limits;
+    for (const auto &info : server->router().routes()) {
+        limits[{info.method, info.pattern}] = info.max_body_size;
+    }
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/inherited_before"}), 10);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/inherited_after"}), 10);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/explicit_zero_before"}), 0);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/explicit_zero_after"}), 0);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/route_local_only"}), 7);
+    CHECK_EQ(limits.at({kale::HttpMethod::GET, "/api/overload"}), 10);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/overload"}), 4);
+    CHECK_EQ(limits.at({kale::HttpMethod::PUT, "/api/overload"}), 0);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/any_capped"}), 5);
+    CHECK_EQ(limits.at({kale::HttpMethod::PUT, "/api/any_capped"}), 5);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/any_zero"}), 0);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/programmatic"}), 12);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/nearest/data"}), 20);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/zero/open"}), 0);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/zero/leaf/open"}), 0);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/zero/leaf/capped"}), 6);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/api/unset/inherited"}), 10);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/rval/inherit"}), 8);
+    CHECK_EQ(limits.at({kale::HttpMethod::POST, "/rval/local"}), 14);
+
+    auto check_allow = [&](std::string_view path, std::string_view method, size_t len) {
+        const int g_before = global_mw_calls.load();
+        const int bp_before = group_mw_calls.load();
+        const int h_before = handler_calls.load();
+        auto res = server.request(path, std::string(method), {}, std::string(len, 'a'));
+        CHECK_EQ(res.status, 200);
+        CHECK_EQ(res.body, std::to_string(len));
+        CHECK_EQ(global_mw_calls.load(), g_before + 1);
+        CHECK_EQ(group_mw_calls.load(), bp_before + 1);
+        CHECK_EQ(handler_calls.load(), h_before + 1);
+    };
+    auto check_reject = [&](std::string_view path, std::string_view method, size_t len) {
+        const int g_before = global_mw_calls.load();
+        const int bp_before = group_mw_calls.load();
+        const int h_before = handler_calls.load();
+        auto res = server.request(path, std::string(method), {}, std::string(len, 'b'));
+        CHECK_EQ(res.status, 413);
+        CHECK_EQ(global_mw_calls.load(), g_before + 1);
+        CHECK_EQ(group_mw_calls.load(), bp_before);
+        CHECK_EQ(handler_calls.load(), h_before);
+    };
+
+    check_allow("/api/inherited_before", "POST", 10);
+    check_reject("/api/inherited_before", "POST", 11);
+    check_allow("/api/inherited_after", "POST", 10);
+    check_reject("/api/inherited_after", "POST", 11);
+
+    // Chunked request body also short-circuits after global middlewares, before route-local middlewares/handler
+    {
+        const int g_before = global_mw_calls.load();
+        const int bp_before = group_mw_calls.load();
+        const int h_before = handler_calls.load();
+        auto chunked_reject = send_raw_http(server.port(),
+            "POST /api/inherited_before HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Connection: close\r\n\r\n"
+            "b\r\n0123456789a\r\n"
+            "0\r\n\r\n");
+        CHECK_EQ(chunked_reject.status, 413);
+        CHECK_EQ(global_mw_calls.load(), g_before + 1);
+        CHECK_EQ(group_mw_calls.load(), bp_before);
+        CHECK_EQ(handler_calls.load(), h_before);
+    }
+
+    check_allow("/api/explicit_zero_before", "POST", 25);
+    check_allow("/api/explicit_zero_after", "POST", 25);
+    check_allow("/api/nearest/data", "POST", 15);
+    check_allow("/api/nearest/data", "POST", 20);
+    check_reject("/api/nearest/data", "POST", 21);
+    check_allow("/api/zero/open", "POST", 25);
+    check_allow("/api/zero/leaf/open", "POST", 25);
+    check_allow("/api/zero/leaf/capped", "POST", 6);
+    check_reject("/api/zero/leaf/capped", "POST", 7);
+    check_allow("/api/unset/inherited", "POST", 10);
+    check_reject("/api/unset/inherited", "POST", 11);
+    check_allow("/api/any_capped", "POST", 5);
+    check_reject("/api/any_capped", "POST", 6);
+    check_allow("/api/any_capped", "PUT", 5);
+    check_reject("/api/any_capped", "PUT", 6);
+    check_allow("/api/any_zero", "POST", 25);
+    check_allow("/api/any_zero", "PUT", 25);
+    check_allow("/api/overload", "POST", 4);
+    check_reject("/api/overload", "POST", 5);
+    check_allow("/api/overload", "PUT", 25);
+    check_allow("/api/programmatic", "POST", 12);
+    check_reject("/api/programmatic", "POST", 13);
+
+    {
+        const int g_before = global_mw_calls.load();
+        const int h_before = handler_calls.load();
+        auto res_rval_ok = server.post("/rval/inherit", std::string(8, 'r'));
+        CHECK_EQ(res_rval_ok.status, 200);
+        CHECK_EQ(handler_calls.load(), h_before + 1);
+        auto res_rval_reject = server.post("/rval/inherit", std::string(9, 'r'));
+        CHECK_EQ(res_rval_reject.status, 413);
+        CHECK_EQ(global_mw_calls.load(), g_before + 2);
+        CHECK_EQ(handler_calls.load(), h_before + 1);
+
+        auto res_rval_local_ok = server.post("/rval/local", std::string(14, 'r'));
+        CHECK_EQ(res_rval_local_ok.status, 200);
+        auto res_rval_local_reject = server.post("/rval/local", std::string(15, 'r'));
+        CHECK_EQ(res_rval_local_reject.status, 413);
+    }
+
+    // Unmatched 404 and 405 paths are unaffected by Blueprint max_body_size
+    auto res_404 = server.post("/api/does_not_exist", std::string(25, 'u'));
+    CHECK_EQ(res_404.status, 404);
+    auto res_405 = server.request("/api/inherited_before", "DELETE", {}, std::string(25, 'u'));
+    CHECK_EQ(res_405.status, 405);
 }
 } // TEST_SUITE("core")

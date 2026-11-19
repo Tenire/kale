@@ -183,6 +183,49 @@ This creates clean route paths:
 - `/api/catalog/items`
 - `/api/articles/posts/{year}/{slug}`
 
+### Group and Route Request Body Size Limits
+
+`Blueprint::max_body_size(size_t)` sets a group-level request body size limit (in bytes) inherited by routes and nested child blueprints when mounted onto a `Router` or `HttpServer`, independent of the order in which routes, child mounts, and `max_body_size()` calls appear:
+
+```cpp
+// Convenience headers (active):
+#include <kale/core.h>
+#include <kale/routing.h>
+
+// Precise headers (alternative; comment the convenience group before enabling):
+// #include "kale/core/blueprint.h"
+// #include "kale/core/context.h"
+// #include "kale/core/http_server.h"
+
+void configure_body_limits(kale::HttpServer &server) {
+    kale::Blueprint api;
+    api.max_body_size(1024); // Default 1 KiB limit for /api and unconfigured descendants
+
+    api.POST("/items", [](kale::Context &ctx) {
+        ctx.string("accepted\n"); // Inherits 1024
+    });
+
+    api.POST("/upload", [](kale::Context &ctx) {
+        ctx.string("large upload\n");
+    }).max_body_size(65536); // Route-local override (64 KiB)
+
+    kale::Blueprint webhook;
+    webhook.max_body_size(0); // Explicitly clears inherited 1024 limit for this group
+    webhook.POST("/events", [](kale::Context &ctx) {
+        ctx.string("unbounded at route level\n");
+    });
+
+    api.mount("/webhooks", std::move(webhook));
+    server.mount("/api", std::move(api));
+}
+```
+
+Precedence and enforcement rules:
+- **Nearest configured group wins**: A child blueprint that calls `max_body_size(...)` overrides any ancestor group's limit for itself and its unconfigured descendants.
+- **Explicit `0` vs. unset**: Calling `Blueprint::max_body_size(0)` on a nested blueprint explicitly disables the inherited route-level check for that group (and unconfigured children), whereas leaving a child blueprint unconfigured inherits the nearest ancestor limit.
+- **Route-local override**: Calling `.max_body_size(limit)` on a `RouteBuilder` (including routes created with `any(...)`) is always route-local and overrides any group limit, including `0` to disable the route-level check on that route alone.
+- **Short-circuit semantics**: Matching requests whose decoded body size strictly exceeds the effective positive limit short-circuit with `413 Payload Too Large` after global middlewares (`request_id`, `access_log`, `error_handler`) and before route-local middlewares and the route handler run; requests with body size equal to the limit are accepted. Global `HttpServerParams::request_size_limit` still caps raw ingress before any middleware runs, and unmatched `404`/`405` paths are unchanged.
+
 ---
 
 ## Route Metadata and Dynamic Enumeration

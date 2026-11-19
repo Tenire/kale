@@ -7,11 +7,14 @@
 #include "kale/http/form.h"
 #include "kale/core/http_error.h"
 #include "kale/core/http_util.h"
+#include "kale/core/error_response.h"
+#include "kale/middleware/error_handler.h"
 #include "workflow/HttpUtil.h"
 #include "workflow/WFTaskFactory.h"
 
 #include <charconv>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -517,4 +520,118 @@ TEST_CASE("CSRF OriginOnly, OriginOrToken, and TokenRequired with trusted_origin
     }
 }
 
+
+TEST_CASE("CSRF emits structured ErrorEvent diagnostics with origin internal_detail") {
+    struct CapturedEvent {
+        int status{0};
+        std::string error_code;
+        std::string source;
+        std::string reason;
+        std::string origin;
+    };
+    std::mutex mu;
+    std::vector<CapturedEvent> events;
+
+    kale::ErrorPolicy policy;
+    policy.on_error = [&](const kale::Context &, const kale::ErrorEvent &ev) {
+        std::lock_guard<std::mutex> lock(mu);
+        std::string origin;
+        if (ev.internal_details != nullptr) {
+            auto it = ev.internal_details->find("origin");
+            if (it != ev.internal_details->end()) {
+                origin = it->second;
+            }
+        }
+        events.push_back({
+            ev.status_code,
+            std::string(ev.error_code),
+            std::string(ev.source),
+            std::string(ev.reason),
+            std::move(origin)
+        });
+    };
+
+    kale::CsrfConfig origin_cfg;
+    origin_cfg.secret = "0123456789abcdef0123456789abcdef";
+    origin_cfg.secure = false;
+    origin_cfg.mode = kale::CsrfMode::OriginOnly;
+    origin_cfg.trusted_origins = {"https://app.example.com"};
+
+    kale::CsrfConfig token_cfg;
+    token_cfg.secret = "0123456789abcdef0123456789abcdef";
+    token_cfg.secure = false;
+    token_cfg.mode = kale::CsrfMode::TokenRequired;
+
+    TestServerRunner srv;
+    srv->use(kale::error_handler(kale::default_standard_json_formatter(), std::move(policy)));
+    srv->POST("/origin", kale::csrf(origin_cfg), [](kale::Context &ctx) -> coke::Task<void> {
+        ctx.string("ok");
+        co_return;
+    });
+    srv->POST("/token", kale::csrf(token_cfg), [](kale::Context &ctx) -> coke::Task<void> {
+        ctx.string("ok");
+        co_return;
+    });
+    srv.start();
+
+    // 1. origin_missing
+    {
+        auto r = srv.request("/origin", "POST");
+        CHECK_EQ(r.status, 403);
+        CHECK_NE(r.body.find("CSRF origin check failed"), std::string::npos);
+    }
+
+    // 2. origin_untrusted (origin in internal_details, never in JSON wire body)
+    {
+        auto r = srv.request("/origin", "POST", {{"Origin", "https://evil.example.com"}});
+        CHECK_EQ(r.status, 403);
+        CHECK_EQ(r.body.find("evil.example.com"), std::string::npos);
+    }
+
+    // 3. cookie_missing
+    {
+        auto r = srv.request("/token", "POST");
+        CHECK_EQ(r.status, 403);
+        CHECK_NE(r.body.find("Invalid or missing CSRF token"), std::string::npos);
+    }
+
+    // 4. token_mismatch
+    {
+        std::string tok1 = kale::generate_csrf_token(token_cfg.secret);
+        std::string tok2 = kale::generate_csrf_token(token_cfg.secret);
+        auto r = srv.request("/token", "POST", {
+            {"Cookie", "_csrf=" + tok1},
+            {"X-CSRF-Token", tok2}
+        });
+        CHECK_EQ(r.status, 403);
+        CHECK_EQ(r.body.find(tok1), std::string::npos);
+        CHECK_EQ(r.body.find(tok2), std::string::npos);
+    }
+
+    srv.stop();
+
+    std::lock_guard<std::mutex> lock(mu);
+    REQUIRE_EQ(events.size(), 4);
+    CHECK_EQ(events[0].status, 403);
+    CHECK_EQ(events[0].error_code, "CSRF_FAILED");
+    CHECK_EQ(events[0].source, "csrf");
+    CHECK_EQ(events[0].reason, "origin_missing");
+    CHECK(events[0].origin.empty());
+
+    CHECK_EQ(events[1].status, 403);
+    CHECK_EQ(events[1].error_code, "CSRF_FAILED");
+    CHECK_EQ(events[1].source, "csrf");
+    CHECK_EQ(events[1].reason, "origin_untrusted");
+    CHECK_EQ(events[1].origin, "https://evil.example.com");
+
+    CHECK_EQ(events[2].status, 403);
+    CHECK_EQ(events[2].error_code, "CSRF_FAILED");
+    CHECK_EQ(events[2].source, "csrf");
+    CHECK_EQ(events[2].reason, "cookie_missing");
+
+    CHECK_EQ(events[3].status, 403);
+    CHECK_EQ(events[3].error_code, "CSRF_FAILED");
+    CHECK_EQ(events[3].source, "csrf");
+    CHECK_EQ(events[3].reason, "token_mismatch");
+}
 } // TEST_SUITE("csrf")

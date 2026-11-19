@@ -304,7 +304,8 @@ coke::Task<void> compose_and_run(
     const std::vector<Middleware> &global_mws,
     const std::vector<Middleware> &route_mws,
     Context &ctx,
-    const Handler &final_handler
+    const Handler &final_handler,
+    size_t max_body_size = 0
 );
 
 inline const std::vector<Middleware> &empty_route_middlewares() noexcept {
@@ -315,9 +316,12 @@ inline const std::vector<Middleware> &empty_route_middlewares() noexcept {
 inline coke::Task<void> compose_and_run(
     const std::vector<Middleware> &mws,
     Context &ctx,
-    const Handler &final_handler) {
-    return compose_and_run(mws, empty_route_middlewares(), ctx, final_handler);
+    const Handler &final_handler,
+    size_t max_body_size = 0) {
+    return compose_and_run(mws, empty_route_middlewares(), ctx, final_handler, max_body_size);
 }
+
+void reply_payload_too_large(Context &ctx, size_t limit_bytes);
 
 // Owning route metadata, independent of endpoint storage and Router lifetime.
 struct RouteInfo {

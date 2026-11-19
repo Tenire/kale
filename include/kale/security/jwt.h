@@ -64,6 +64,8 @@ enum class JwtError {
     UnsupportedHeaderParameter, // Unsupported critical header parameter (e.g. 'crit', 'b64', 'jku')
     TypeMismatch,               // Header 'typ' is invalid, missing when required, or mismatched
     KidMismatch,                // Header 'kid' is invalid, missing when required, or mismatched
+    TokenRejected,              // Opaque bearer token was rejected by application token_verifier
+    MissingToken,               // Authorization header is missing or has non-matching scheme
 };
 
 const char* to_string(JwtError err) noexcept;
@@ -323,14 +325,19 @@ struct BearerAuthConfig {
 
     // Optional custom unauthorized response handler
     std::function<void(Context &ctx, JwtError err)> on_unauthorized;
+
+    // Optional synchronous opaque bearer token verifier (replaces JWT verification when set)
+    std::function<bool(const Context &ctx, std::string_view token)> token_verifier;
 };
 
 /**
  * Creates Bearer authentication middleware adhering to RFC 6750.
- * Attaches VerifiedJwtClaims to Context on success; responds with 401 on failure.
+ * In JWT mode, verifies the token and attaches VerifiedJwtClaims to Context on success.
+ * When token_verifier is set, runs in opaque bearer token mode instead of JWT verification
+ * without consulting key_resolver or modifying VerifiedJwtClaims attachments.
+ * Responds with 401 on failure.
  */
 Middleware bearer_auth(BearerAuthConfig config);
-
 /**
  * Retrieves verified claims injected into Context by bearer_auth middleware.
  * Returns nullptr if authentication was not performed or failed.

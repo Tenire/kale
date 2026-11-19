@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,9 @@
 #include "kale/http/health.h"
 #include "kale/core/http_error.h"
 #include "kale/middleware/prometheus.h"
+#include "kale/core/error_response.h"
+#include "kale/middleware/error_handler.h"
+#include "kale/middleware/cors.h"
 #include "kale/middleware/rate_limiter.h"
 #include "workflow/HttpUtil.h"
 #include "workflow/WFTaskFactory.h"
@@ -392,5 +396,173 @@ TEST_CASE("readiness callback completes after a peer disconnect and state remain
     release = true;
     finished_fut.wait();
     CHECK(ready.load());
+}
+
+TEST_CASE("rate_limiter emits structured ErrorEvent diagnostics for quota, key length, and capacity") {
+    struct CapturedEvent {
+        int status{0};
+        std::string source;
+        std::string reason;
+        std::string retry_after;
+        std::string route_tag;
+    };
+    std::mutex mu;
+    std::vector<CapturedEvent> events;
+
+    kale::ErrorPolicy policy;
+    policy.on_error = [&](const kale::Context &, const kale::ErrorEvent &ev) {
+        std::lock_guard<std::mutex> lock(mu);
+        std::string retry_after;
+        std::string route_tag;
+        if (ev.internal_details != nullptr) {
+            if (auto it = ev.internal_details->find("retry_after"); it != ev.internal_details->end()) {
+                retry_after = it->second;
+            }
+            if (auto it = ev.internal_details->find("route_tag"); it != ev.internal_details->end()) {
+                route_tag = it->second;
+            }
+        }
+        events.push_back({
+            ev.status_code,
+            std::string(ev.source),
+            std::string(ev.reason),
+            std::move(retry_after),
+            std::move(route_tag)
+        });
+    };
+
+    kale::RateLimitPolicy rl_policy;
+    rl_policy.limit = 1;
+    rl_policy.window = std::chrono::seconds(60);
+    rl_policy.max_keys = 1;
+    rl_policy.max_key_bytes = 24;
+    kale::MemoryRateLimitStore store(rl_policy);
+
+    kale::RateLimiterConfig rl_cfg;
+    rl_cfg.route_tag = "api";
+    rl_cfg.key_extractor = [](const kale::Context &ctx) {
+        return ctx.header("X-Client-Key");
+    };
+
+    Server server;
+    server.server.use(kale::error_handler(kale::default_standard_json_formatter(), std::move(policy)));
+    server.server.GET("/rl", kale::rate_limiter(store, std::move(rl_cfg)), [](kale::Context &ctx) -> coke::Task<void> {
+        ctx.string("ok");
+        co_return;
+    });
+    server.start();
+
+    const std::string base = "http://127.0.0.1:" + std::to_string(server.server.listen_port());
+    auto send_get = [&](const std::string &key) -> int {
+        return coke::sync_wait([&]() -> coke::Task<int> {
+            auto *task = WFTaskFactory::create_http_task(base + "/rl", 0, 0, nullptr);
+            task->get_req()->set_method("GET");
+            task->get_req()->add_header_pair("X-Client-Key", key);
+            auto res = co_await coke::HttpAwaiter(task);
+            REQUIRE_EQ(res.state, WFT_STATE_SUCCESS);
+            co_return std::stoi(res.resp.get_status_code());
+        }());
+    };
+
+    // 1. First request for "k1" succeeds
+    CHECK_EQ(send_get("k1"), 200);
+    // 2. Second request for "k1" -> quota_exceeded
+    CHECK_EQ(send_get("k1"), 429);
+    // 3. New key "k2" when max_keys == 1 -> capacity_exceeded
+    CHECK_EQ(send_get("k2"), 429);
+    // 4. Overlong key -> key_too_long
+    CHECK_EQ(send_get(std::string(64, 'x')), 429);
+    server.server.stop();
+
+
+    std::lock_guard<std::mutex> lock(mu);
+    REQUIRE_EQ(events.size(), 3);
+
+    CHECK_EQ(events[0].status, 429);
+    CHECK_EQ(events[0].source, "rate_limiter");
+    CHECK_EQ(events[0].reason, "quota_exceeded");
+    CHECK_FALSE(events[0].retry_after.empty());
+    CHECK_EQ(events[0].route_tag, "api");
+
+    CHECK_EQ(events[1].status, 429);
+    CHECK_EQ(events[1].source, "rate_limiter");
+    CHECK_EQ(events[1].reason, "capacity_exceeded");
+    CHECK_FALSE(events[1].retry_after.empty());
+    CHECK_EQ(events[1].route_tag, "api");
+
+    CHECK_EQ(events[2].status, 429);
+    CHECK_EQ(events[2].source, "rate_limiter");
+    CHECK_EQ(events[2].reason, "key_too_long");
+    CHECK_FALSE(events[2].retry_after.empty());
+    CHECK_EQ(events[2].route_tag, "api");
+}
+
+TEST_CASE("cors emits structured ErrorEvent diagnostics for preflight denials") {
+    struct CapturedEvent {
+        int status{0};
+        std::string source;
+        std::string reason;
+    };
+    std::mutex mu;
+    std::vector<CapturedEvent> events;
+
+    kale::ErrorPolicy policy;
+    policy.on_error = [&](const kale::Context &, const kale::ErrorEvent &ev) {
+        std::lock_guard<std::mutex> lock(mu);
+        events.push_back({
+            ev.status_code,
+            std::string(ev.source),
+            std::string(ev.reason)
+        });
+    };
+
+    kale::CorsConfig cors_cfg;
+    cors_cfg.allow_origins = {"https://app.example.com"};
+    cors_cfg.allow_methods = {"GET", "POST"};
+    cors_cfg.allow_headers = {"Content-Type"};
+
+    Server server;
+    server.server.use(kale::error_handler(kale::default_standard_json_formatter(), std::move(policy)));
+    server.server.use(kale::cors(std::move(cors_cfg)));
+    server.server.OPTIONS("/res", [](kale::Context &ctx) -> coke::Task<void> {
+        ctx.set_status(204);
+        co_return;
+    });
+    server.start();
+
+    const std::string base = "http://127.0.0.1:" + std::to_string(server.server.listen_port());
+    auto send_preflight = [&](const std::string &origin, const std::string &method, const std::string &headers = "") -> int {
+        return coke::sync_wait([&]() -> coke::Task<int> {
+            auto *task = WFTaskFactory::create_http_task(base + "/res", 0, 0, nullptr);
+            task->get_req()->set_method("OPTIONS");
+            task->get_req()->add_header_pair("Origin", origin);
+            task->get_req()->add_header_pair("Access-Control-Request-Method", method);
+            if (!headers.empty()) {
+                task->get_req()->add_header_pair("Access-Control-Request-Headers", headers);
+            }
+            auto res = co_await coke::HttpAwaiter(task);
+            REQUIRE_EQ(res.state, WFT_STATE_SUCCESS);
+            co_return std::stoi(res.resp.get_status_code());
+        }());
+    };
+
+    CHECK_EQ(send_preflight("https://evil.example.com", "GET"), 403);
+    CHECK_EQ(send_preflight("https://app.example.com", "DELETE"), 403);
+    CHECK_EQ(send_preflight("https://app.example.com", "POST", "X-Forbidden-Header"), 403);
+
+    std::lock_guard<std::mutex> lock(mu);
+    REQUIRE_EQ(events.size(), 3);
+
+    CHECK_EQ(events[0].status, 403);
+    CHECK_EQ(events[0].source, "cors");
+    CHECK_EQ(events[0].reason, "preflight_origin_denied");
+
+    CHECK_EQ(events[1].status, 403);
+    CHECK_EQ(events[1].source, "cors");
+    CHECK_EQ(events[1].reason, "preflight_method_denied");
+
+    CHECK_EQ(events[2].status, 403);
+    CHECK_EQ(events[2].source, "cors");
+    CHECK_EQ(events[2].reason, "preflight_header_denied");
 }
 } // TEST_SUITE

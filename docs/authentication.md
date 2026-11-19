@@ -237,6 +237,74 @@ HTTP/1.1 403 Forbidden
 
 ---
 
+### Opaque Bearer Token Mode (`token_verifier`)
+
+When integrating API keys, session-backed bearer tokens, or custom in-memory token registries, `BearerAuthConfig::token_verifier` enables **opaque bearer mode** instead of JWT verification:
+
+```cpp
+// Convenience headers (active):
+#include <kale/core.h>
+#include <kale/middlewares.h>
+#include <kale/security.h>
+
+// Precise headers (alternative; comment the convenience group before enabling):
+// #include "kale/core/context.h"
+// #include "kale/core/http_server.h"
+// #include "kale/core/http_status.h"
+// #include "kale/middleware/access_log.h"
+// #include "kale/security/jwt.h"
+
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+
+void configure_opaque_bearer(kale::HttpServer &server,
+                           const std::unordered_set<std::string> &valid_tokens,
+                           std::mutex &tokens_mu) {
+    server.use(kale::access_log([](kale::AccessLogRecord rec) {
+        // Generic status/timing access logging (never log Authorization headers or raw tokens)
+        (void)rec;
+    }));
+
+    kale::BearerAuthConfig cfg;
+    cfg.realm = "service-api";
+    cfg.skip_paths = {"/health"};
+    cfg.token_verifier = [&valid_tokens, &tokens_mu](const kale::Context &ctx, std::string_view token) -> bool {
+        (void)ctx;
+        std::lock_guard<std::mutex> lock(tokens_mu);
+        return valid_tokens.find(std::string(token)) != valid_tokens.end();
+    };
+    cfg.on_unauthorized = [](kale::Context &ctx, kale::JwtError err) {
+        // Status 401 and WWW-Authenticate (including escaped realm) are pre-set before this hook runs.
+        // App-specific logging may record kale::to_string(err) and ctx.path(), never the raw token.
+        ctx.json(kale::Json::Object{
+            {"error", "unauthorized"},
+            {"reason", kale::to_string(err)}
+        });
+    };
+
+    server.use(kale::bearer_auth(std::move(cfg)));
+}
+```
+
+- **Replaces JWT mode**: Providing `token_verifier` allows a verifier-only `BearerAuthConfig` (no `secret_or_public_key` or `key_resolver` required). In opaque mode, `bearer_auth` never consults `key_resolver`, never falls back to `JwtValidator` if `token_verifier` returns `false`, and never attaches or erases `VerifiedJwtClaims` on `Context` (any pre-existing `VerifiedJwtClaims` attachment from an outer middleware is preserved).
+- **Common routing/extraction & RFC 6750 behavior**: `skip_paths`, `header_name`, `header_prefix`, and `realm` work across both modes. Before invoking `token_verifier`, `bearer_auth` checks credentials per RFC 6750:
+  - Missing `header_name` header or a non-matching authentication scheme (e.g., `Basic ...`) returns `401 Unauthorized` with `WWW-Authenticate: Bearer` (or `Bearer realm="..."` with escaped quotes/backslashes) and **no** `error` parameter, passing `JwtError::MissingToken` to `on_unauthorized` (and emitting `reason="missing_token"` in `ErrorEvent` when using default `reply_error`).
+  - Duplicate headers, empty header values, malformed Bearer credentials, or tokens failing RFC 6750 `b64token` shape (`1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`, allowing dots and trailing `=` padding only) are rejected before `token_verifier` with `401 Unauthorized`, `WWW-Authenticate: Bearer [realm="...", ]error="invalid_token"`, and `JwtError::MalformedToken`.
+  - A syntactically valid Bearer token rejected by `token_verifier` (`false`) returns `401 Unauthorized` with `error="invalid_token"` and `JwtError::TokenRejected`.
+- **Synchronous execution & exceptions**: `token_verifier` is synchronous and must not perform blocking I/O on worker threads (for asynchronous introspection, validate inside a coroutine middleware). Any exception thrown by `token_verifier` or `on_unauthorized` propagates through normal middleware error handling (`error_handler` / `access_log` / `HttpServer`).
+
+### Rejection Hook (`on_unauthorized`), Logging, Lifetimes & Thread-Safety
+
+- **`on_unauthorized` hook**: `BearerAuthConfig::on_unauthorized` is the application-specific rejection callback for both JWT and opaque modes. `bearer_auth` pre-sets `HttpStatus::Unauthorized` (`401`) and `WWW-Authenticate` (including escaped `realm` when configured, and `error="invalid_token"` when applicable) before invoking `on_unauthorized`, so custom responders only need to write a response body or emit app-specific diagnostics (and may override status or headers if needed). Configuring `on_unauthorized` replaces the default `reply_error` call, so `ErrorPolicy::on_error` will not receive that rejection event unless `on_unauthorized` itself invokes `reply_error`.
+- **Generic status logging**: `bearer_auth` defines no separate logging policy; install `kale::access_log(...)` outside `bearer_auth` (and outside `error_handler`) to record generic HTTP status codes (`401`, `200`, or exception status) and request timings.
+- **No token logging**: Never log raw `Authorization` headers or extracted bearer tokens from `token_verifier`, `on_unauthorized`, or `access_log` sinks. Log only safe metadata such as `kale::to_string(err)`, `ctx.path()`, status codes, or request IDs.
+- **Lifetimes & thread-safety**:
+  - `BearerAuthConfig` callbacks (`token_verifier`, `on_unauthorized`, `key_resolver`, `validator` clock) are invoked concurrently across worker threads and must be thread-safe; any captured state must outlive the `HttpServer`.
+  - The `const Context &` and `std::string_view token` arguments to `token_verifier` borrow request-scoped storage and are valid only during that synchronous call; copy into an owned `std::string` if data must outlive the call.
+
+---
 ## Part 2: Secure Forms & CSRF Defense
 
 ### Architecture & Origin/Cookie/CSRF Boundary

@@ -2,8 +2,12 @@
 
 #include "coke/http/http_client.h"
 #include "coke/wait.h"
+#include "kale/core/http_error.h"
 #include "kale/core/http_server.h"
 #include "kale/core/http_util.h"
+#include "kale/middleware/access_log.h"
+#include "kale/core/error_response.h"
+#include "kale/middleware/error_handler.h"
 #include "kale/security/jwt.h"
 #include "http/base64.h"
 #include "security/crypto_util.h"
@@ -18,11 +22,12 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
-
 namespace {
 
 struct KeyPair {
@@ -722,7 +727,7 @@ TEST_CASE("BearerAuth HTTP Server E2E") {
     {
         auto r = srv.request("/protected");
         CHECK_EQ(r.status, 401);
-        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer error=\"invalid_token\"");
+        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer");
         CHECK_NE(r.body.find("Unauthorized"), std::string::npos);
         // Ensure no internal diagnostics leaked
         CHECK_EQ(r.body.find("JwtError"), std::string::npos);
@@ -737,10 +742,11 @@ TEST_CASE("BearerAuth HTTP Server E2E") {
         CHECK_EQ(r.status, 401);
     }
 
-    // 4. Protected endpoint with malformed scheme -> 401
+    // 4. Protected endpoint with non-matching scheme -> 401 plain Bearer challenge
     {
         auto r = srv.request("/protected", "GET", {{"Authorization", "Basic dXNlcjpwYXNz"}});
         CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer");
     }
 
     // 5. Protected endpoint with invalid token -> 401
@@ -983,5 +989,507 @@ TEST_CASE("JwtValidator::verify with dynamic JwtKeyResolver and bearer_auth inte
     auto r_bad = srv.request("/me", "GET", {{"Authorization", "Bearer " + *tok_unknown}});
     CHECK_EQ(r_bad.status, 401);
     CHECK(r_bad.header("WWW-Authenticate").find("error=\"invalid_token\"") != std::string::npos);
+}
+
+TEST_CASE("Opaque bearer mode configuration, to_string, and validation boundaries") {
+    CHECK_EQ(std::string_view(kale::to_string(kale::JwtError::TokenRejected)), "token_rejected");
+
+    // Neither JWT credentials nor token_verifier -> invalid_argument
+    {
+        kale::BearerAuthConfig cfg;
+        CHECK_THROWS_AS(kale::bearer_auth(std::move(cfg)), std::invalid_argument);
+    }
+
+    // Verifier-only configuration succeeds
+    {
+        kale::BearerAuthConfig cfg;
+        cfg.token_verifier = [](const kale::Context &, std::string_view tok) {
+            return tok == "ok-token";
+        };
+        CHECK_NOTHROW(kale::bearer_auth(std::move(cfg)));
+    }
+
+    // Empty header_name or header_prefix still throws in opaque mode
+    {
+        kale::BearerAuthConfig cfg;
+        cfg.header_name.clear();
+        cfg.token_verifier = [](const kale::Context &, std::string_view) { return true; };
+        CHECK_THROWS_AS(kale::bearer_auth(std::move(cfg)), std::invalid_argument);
+    }
+    {
+        kale::BearerAuthConfig cfg;
+        cfg.header_prefix.clear();
+        cfg.token_verifier = [](const kale::Context &, std::string_view) { return true; };
+        CHECK_THROWS_AS(kale::bearer_auth(std::move(cfg)), std::invalid_argument);
+    }
+}
+
+TEST_CASE("Opaque bearer mode replaces JWT, preserves claims, and disables fallback") {
+    const std::string secret = "kale_super_secret_key_1234567890_abcdefghijklmnopqrstuvwxyz_0123456789";
+    kale::JwtClaims claims;
+    claims.set_issuer("outer-issuer")
+          .set_subject("outer-subject")
+          .set_expires_at(1800000000);
+    auto jwt_res = kale::JwtSigner::sign_hmac(claims, secret, kale::JwtAlgorithm::HS256, "k1");
+    REQUIRE(jwt_res.has_value());
+    const std::string valid_jwt = *jwt_res;
+
+    kale::JwtValidator validator;
+    validator.allow_algorithm(kale::JwtAlgorithm::HS256)
+             .require_issuer("outer-issuer")
+             .set_clock([]() -> int64_t { return 1750000000; });
+    auto verified_outer = validator.verify_hmac(valid_jwt, secret);
+    REQUIRE(verified_outer.has_value());
+
+    int resolver_calls = 0;
+    int verifier_calls = 0;
+    std::string last_seen_token;
+
+    kale::BearerAuthConfig cfg;
+    cfg.validator = validator;
+    cfg.secret_or_public_key = secret;
+    cfg.key_resolver = [&](std::string_view, kale::JwtAlgorithm) -> std::optional<kale::JwtKeyMaterial> {
+        ++resolver_calls;
+        return kale::JwtKeyMaterial{secret, false};
+    };
+    cfg.token_verifier = [&](const kale::Context &ctx, std::string_view token) {
+        ++verifier_calls;
+        last_seen_token.assign(token);
+        return token == "opaque.token_123-XYZ~+/==" && ctx.header_view("X-Tenant") == "acme";
+    };
+
+    // Case A: without pre-existing claims, opaque auth never attaches VerifiedJwtClaims
+    {
+        TestServerRunner srv;
+        srv->use(kale::bearer_auth(cfg));
+        srv->GET("/data", [](kale::Context &ctx) {
+            CHECK_EQ(kale::get_jwt_claims(ctx), nullptr);
+            ctx.string("ok");
+        });
+        srv.start();
+
+        auto r_ok = srv.request("/data", "GET", {
+            {"Authorization", "Bearer opaque.token_123-XYZ~+/=="},
+            {"X-Tenant", "acme"}
+        });
+        CHECK_EQ(r_ok.status, 200);
+        CHECK_EQ(r_ok.body, "ok");
+        CHECK_EQ(last_seen_token, "opaque.token_123-XYZ~+/==");
+        CHECK_EQ(resolver_calls, 0);
+
+        // Valid signed JWT rejected by opaque verifier must NOT fall back to JWT verification
+        auto r_jwt = srv.request("/data", "GET", {
+            {"Authorization", "Bearer " + valid_jwt},
+            {"X-Tenant", "acme"}
+        });
+        CHECK_EQ(r_jwt.status, 401);
+        CHECK_EQ(r_jwt.header("WWW-Authenticate"), "Bearer error=\"invalid_token\"");
+        CHECK_EQ(resolver_calls, 0);
+    }
+
+    // Case B: pre-existing VerifiedJwtClaims on Context are preserved (not erased or overwritten)
+    {
+        TestServerRunner srv;
+        srv->use([pre_claims = *verified_outer](kale::Context &ctx, kale::Next next) -> coke::Task<void> {
+            ctx.set_attachment<kale::VerifiedJwtClaims>(kale::VerifiedJwtClaims(pre_claims));
+            co_await next();
+        });
+        srv->use(kale::bearer_auth(cfg));
+        srv->GET("/preserved", [](kale::Context &ctx) {
+            const auto *claims_ptr = kale::get_jwt_claims(ctx);
+            REQUIRE_NE(claims_ptr, nullptr);
+            ctx.string(std::string(claims_ptr->subject()));
+        });
+        srv.start();
+
+        auto r = srv.request("/preserved", "GET", {
+            {"Authorization", "Bearer opaque.token_123-XYZ~+/=="},
+            {"X-Tenant", "acme"}
+        });
+        CHECK_EQ(r.status, 200);
+        CHECK_EQ(r.body, "outer-subject");
+        CHECK_EQ(resolver_calls, 0);
+    }
+}
+
+TEST_CASE("Opaque bearer mode RFC 6750 extraction, realm escaping, and rejection edges") {
+    int verifier_calls = 0;
+    std::vector<std::pair<kale::JwtError, std::string>> hook_events;
+    bool hook_saw_preset_401 = false;
+    std::string hook_preset_challenge;
+
+    kale::BearerAuthConfig cfg;
+    cfg.realm = "api \"secure\" \\ test";
+    cfg.skip_paths = {"/health"};
+    cfg.token_verifier = [&](const kale::Context &, std::string_view token) {
+        ++verifier_calls;
+        return token == "good.opaque.tok==";
+    };
+
+    const std::string expected_plain_challenge = "Bearer realm=\"api \\\"secure\\\" \\\\ test\"";
+    const std::string expected_err_challenge = "Bearer realm=\"api \\\"secure\\\" \\\\ test\", error=\"invalid_token\"";
+
+    // Default responder server
+    TestServerRunner default_srv;
+    default_srv->use(kale::bearer_auth(cfg));
+    default_srv->GET("/health", [](kale::Context &ctx) { ctx.string("healthy"); });
+    default_srv->GET("/resource", [](kale::Context &ctx) { ctx.string("granted"); });
+    default_srv.start();
+
+    // 1. Skip path bypasses verifier
+    CHECK_EQ(default_srv.request("/health").status, 200);
+    CHECK_EQ(verifier_calls, 0);
+
+    // 2. Absent credentials -> 401 with realm challenge and NO error="invalid_token"
+    {
+        auto r = default_srv.request("/resource");
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), expected_plain_challenge);
+        CHECK_EQ(verifier_calls, 0);
+    }
+
+    // 3. Non-matching schemes -> 401 with realm challenge and NO error="invalid_token"
+    for (const std::string &hdr : {
+             std::string("Basic dXNlcjpwYXNz"),
+             std::string("Digest username=\"alice\""),
+             std::string("BearerToken abcdef")}) {
+        auto r = default_srv.request("/resource", "GET", {{"Authorization", hdr}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), expected_plain_challenge);
+        CHECK_EQ(verifier_calls, 0);
+    }
+
+    // 4. Duplicate / empty / malformed Bearer credentials -> 401 invalid_token BEFORE verifier
+    {
+        auto r_dup = default_srv.request("/resource", "GET", {
+            {"Authorization", "Bearer good.opaque.tok=="},
+            {"Authorization", "Bearer good.opaque.tok=="}
+        });
+        CHECK_EQ(r_dup.status, 401);
+        CHECK_EQ(r_dup.header("WWW-Authenticate"), expected_err_challenge);
+        CHECK_EQ(verifier_calls, 0);
+    }
+    for (const std::string &hdr : {
+             std::string(""),
+             std::string("Bearer"),
+             std::string("bearer"),
+             std::string("Bearer "),
+             std::string("Bearer\tgood.opaque.tok=="),
+             std::string("Bearer tok1 tok2"),
+             std::string("Bearer tok1,tok2"),
+             std::string("Bearer abc=def"),
+             std::string("Bearer ="),
+             std::string("Bearer =="),
+             std::string("Bearer bad!token")}) {
+        auto r = default_srv.request("/resource", "GET", {{"Authorization", hdr}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), expected_err_challenge);
+        CHECK_EQ(verifier_calls, 0);
+    }
+
+    // 5. Valid shape rejected by verifier -> 401 invalid_token
+    {
+        auto r = default_srv.request("/resource", "GET", {{"Authorization", "bearer wrong.opaque.tok=="}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), expected_err_challenge);
+        CHECK_EQ(verifier_calls, 1);
+    }
+
+    // 6. Valid shape with extra OWS around token accepted
+    {
+        auto r = default_srv.request("/resource", "GET", {{"Authorization", "Bearer   good.opaque.tok==  "}});
+        CHECK_EQ(r.status, 200);
+        CHECK_EQ(r.body, "granted");
+        CHECK_EQ(verifier_calls, 2);
+    }
+
+    // Custom on_unauthorized hook honors escaped realm and pre-sets 401 + header before callback
+    kale::BearerAuthConfig hook_cfg = cfg;
+    hook_cfg.on_unauthorized = [&](kale::Context &ctx, kale::JwtError err) {
+        hook_saw_preset_401 = (ctx.status_code() == 401);
+        hook_preset_challenge = std::string(ctx.resp_header("WWW-Authenticate"));
+        hook_events.emplace_back(err, std::string(kale::to_string(err)));
+        ctx.string(std::string("custom:") + kale::to_string(err));
+    };
+
+    TestServerRunner hook_srv;
+    hook_srv->use(kale::bearer_auth(std::move(hook_cfg)));
+    hook_srv->GET("/resource", [](kale::Context &ctx) { ctx.string("granted"); });
+    hook_srv.start();
+
+    // Absent -> JwtError::None + plain challenge pre-set
+    {
+        auto r = hook_srv.request("/resource");
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), expected_plain_challenge);
+        CHECK_EQ(r.body, "custom:missing_token");
+        CHECK(hook_saw_preset_401);
+        CHECK_EQ(hook_preset_challenge, expected_plain_challenge);
+    }
+
+    // Malformed Bearer -> JwtError::MalformedToken + invalid_token challenge pre-set
+    {
+        auto r = hook_srv.request("/resource", "GET", {{"Authorization", "Bearer bad=tok"}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), expected_err_challenge);
+        CHECK_EQ(r.body, "custom:malformed_token");
+        CHECK(hook_saw_preset_401);
+        CHECK_EQ(hook_preset_challenge, expected_err_challenge);
+    }
+
+    // Rejected valid token -> JwtError::TokenRejected + invalid_token challenge pre-set
+    {
+        auto r = hook_srv.request("/resource", "GET", {{"Authorization", "Bearer unknown.tok"}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), expected_err_challenge);
+        CHECK_EQ(r.body, "custom:token_rejected");
+        CHECK(hook_saw_preset_401);
+        CHECK_EQ(hook_preset_challenge, expected_err_challenge);
+    }
+}
+
+TEST_CASE("Opaque bearer mode custom header_prefix boundary, outer access_log, and callback exceptions") {
+    std::mutex mu;
+    std::vector<kale::AccessLogRecord> logs;
+    std::vector<std::string> app_audit;
+
+    kale::BearerAuthConfig cfg;
+    cfg.header_name = "X-Api-Auth";
+    cfg.header_prefix = "Bearer"; // No trailing space: must still distinguish "BearerToken" from "Bearer"
+    cfg.realm = "service";
+    cfg.token_verifier = [](const kale::Context &, std::string_view token) {
+        if (token == "throw-http") {
+            throw kale::HttpError(503, "introspection unavailable", "AUTH_BACKEND_DOWN");
+        }
+        if (token == "throw-runtime") {
+            throw std::runtime_error("unexpected verifier failure");
+        }
+        return token == "secret-opaque-token";
+    };
+    cfg.on_unauthorized = [&](kale::Context &ctx, kale::JwtError err) {
+        // App hook logs only safe metadata (never raw bearer token)
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            app_audit.push_back(std::string(ctx.path()) + ":" + kale::to_string(err));
+        }
+        if (ctx.has_header("X-Hook-Throw")) {
+            throw kale::HttpError(502, "hook failed", "HOOK_ERROR");
+        }
+        ctx.string(std::string("rejected:") + kale::to_string(err));
+    };
+
+    TestServerRunner srv;
+    srv->use(kale::access_log([&](kale::AccessLogRecord rec) {
+        std::lock_guard<std::mutex> lock(mu);
+        logs.push_back(std::move(rec));
+    }));
+    srv->use(kale::bearer_auth(std::move(cfg)));
+    srv->GET("/items", [](kale::Context &ctx) { ctx.string("items-ok"); });
+    srv.start();
+
+    // 1. Different scheme starting with prefix ("BearerToken ...") -> no matching scheme (JwtError::None)
+    {
+        auto r = srv.request("/items", "GET", {{"X-Api-Auth", "BearerToken secret-opaque-token"}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer realm=\"service\"");
+        CHECK_EQ(r.body, "rejected:missing_token");
+    }
+
+    // 2. Rejected token -> 401 TokenRejected, outer access_log sees 401 without exception
+    {
+        auto r = srv.request("/items", "GET", {{"X-Api-Auth", "Bearer wrong-token"}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer realm=\"service\", error=\"invalid_token\"");
+        CHECK_EQ(r.body, "rejected:token_rejected");
+    }
+
+    // 3. Accepted token -> 200 OK
+    {
+        auto r = srv.request("/items", "GET", {{"X-Api-Auth", "Bearer secret-opaque-token"}});
+        CHECK_EQ(r.status, 200);
+        CHECK_EQ(r.body, "items-ok");
+    }
+
+    // 4. Verifier HttpError(503) propagates cleanly through outer middleware
+    {
+        auto r = srv.request("/items", "GET", {{"X-Api-Auth", "Bearer throw-http"}});
+        CHECK_EQ(r.status, 503);
+    }
+
+    // 5. Verifier std::runtime_error propagates as 500
+    {
+        auto r = srv.request("/items", "GET", {{"X-Api-Auth", "Bearer throw-runtime"}});
+        CHECK_EQ(r.status, 500);
+    }
+
+    // 6. on_unauthorized exception propagates cleanly
+    {
+        auto r = srv.request("/items", "GET", {
+            {"X-Api-Auth", "Bearer wrong-token"},
+            {"X-Hook-Throw", "1"}
+        });
+        CHECK_EQ(r.status, 502);
+    }
+
+    srv.stop();
+
+    std::lock_guard<std::mutex> lock(mu);
+    REQUIRE_EQ(logs.size(), 6);
+    CHECK_EQ(logs[0].status_code, 401);
+    CHECK_FALSE(logs[0].downstream_exception);
+    CHECK_EQ(logs[1].status_code, 401);
+    CHECK_FALSE(logs[1].downstream_exception);
+    CHECK_EQ(logs[2].status_code, 200);
+    CHECK_FALSE(logs[2].downstream_exception);
+    CHECK_EQ(logs[3].status_code, 503);
+    CHECK(logs[3].downstream_exception);
+    CHECK_EQ(logs[4].status_code, 500);
+    CHECK(logs[4].downstream_exception);
+    CHECK_EQ(logs[5].status_code, 502);
+    CHECK(logs[5].downstream_exception);
+
+    REQUIRE_EQ(app_audit.size(), 3);
+    CHECK_EQ(app_audit[0], "/items:missing_token");
+    CHECK_EQ(app_audit[1], "/items:token_rejected");
+    CHECK_EQ(app_audit[2], "/items:token_rejected");
+}
+
+TEST_CASE("bearer_auth emits structured ErrorEvent diagnostics without leaking tokens") {
+    struct CapturedEvent {
+        int status{0};
+        std::string error_code;
+        std::string source;
+        std::string reason;
+    };
+    std::mutex mu;
+    std::vector<CapturedEvent> events;
+
+    kale::ErrorPolicy policy;
+    policy.on_error = [&](const kale::Context &, const kale::ErrorEvent &ev) {
+        std::lock_guard<std::mutex> lock(mu);
+        events.push_back({
+            ev.status_code,
+            std::string(ev.error_code),
+            std::string(ev.source),
+            std::string(ev.reason)
+        });
+    };
+
+    const std::string secret = "0123456789abcdef0123456789abcdef";
+    kale::JwtValidator validator;
+    validator.allow_algorithm(kale::JwtAlgorithm::HS256);
+    kale::BearerAuthConfig jwt_cfg;
+    jwt_cfg.secret_or_public_key = secret;
+    jwt_cfg.validator = validator;
+
+    TestServerRunner srv;
+    srv->use(kale::error_handler(kale::default_standard_json_formatter(), std::move(policy)));
+    srv->GET("/jwt", kale::bearer_auth(jwt_cfg), [](kale::Context &ctx) -> coke::Task<void> {
+        ctx.string("ok");
+        co_return;
+    });
+
+    kale::BearerAuthConfig opaque_cfg;
+    opaque_cfg.token_verifier = [](const kale::Context &, std::string_view token) {
+        return token == "good-opaque-token";
+    };
+    srv->GET("/opaque", kale::bearer_auth(std::move(opaque_cfg)), [](kale::Context &ctx) -> coke::Task<void> {
+        ctx.string("ok");
+        co_return;
+    });
+
+    srv.start();
+
+    // 1. Missing Authorization header in JWT mode -> RFC 6750 UNAUTHORIZED (no invalid_token)
+    {
+        auto r = srv.request("/jwt", "GET");
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer");
+        CHECK_NE(r.body.find("UNAUTHORIZED"), std::string::npos);
+        CHECK_EQ(r.body.find("invalid_token"), std::string::npos);
+    }
+
+    // 2. Expired JWT -> invalid_token + token_expired
+    {
+        kale::JwtClaims claims;
+        claims.set_subject("u1");
+        claims.set_expires_at(1);
+        auto expired_tok = kale::JwtSigner::sign_hmac(claims, secret, kale::JwtAlgorithm::HS256);
+        REQUIRE(expired_tok.has_value());
+        auto r = srv.request("/jwt", "GET", {{"Authorization", "Bearer " + *expired_tok}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.body.find(*expired_tok), std::string::npos);
+    }
+
+    // 3. Invalid signature JWT -> signature_mismatch
+    {
+        kale::JwtClaims claims;
+        claims.set_subject("u1");
+        auto bad_sig_tok = kale::JwtSigner::sign_hmac(
+            claims,
+            "wrong-secret-0123456789abcdef0123",
+            kale::JwtAlgorithm::HS256);
+        REQUIRE(bad_sig_tok.has_value());
+        auto r = srv.request("/jwt", "GET", {{"Authorization", "Bearer " + *bad_sig_tok}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.body.find(*bad_sig_tok), std::string::npos);
+    }
+
+    // 4. Opaque rejected -> token_rejected
+    {
+        auto r = srv.request("/opaque", "GET", {{"Authorization", "Bearer bad-opaque-secret"}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.body.find("bad-opaque-secret"), std::string::npos);
+    }
+
+    // 5. Non-matching Basic scheme in JWT mode -> MissingToken + plain Bearer challenge
+    {
+        auto r = srv.request("/jwt", "GET", {{"Authorization", "Basic dXNlcjpwYXNz"}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer");
+        CHECK_EQ(r.body.find("invalid_token"), std::string::npos);
+    }
+
+    // 6. Non-matching Basic scheme in opaque mode -> MissingToken + plain Bearer challenge
+    {
+        auto r = srv.request("/opaque", "GET", {{"Authorization", "Basic dXNlcjpwYXNz"}});
+        CHECK_EQ(r.status, 401);
+        CHECK_EQ(r.header("WWW-Authenticate"), "Bearer");
+        CHECK_EQ(r.body.find("invalid_token"), std::string::npos);
+    }
+
+    srv.stop();
+
+    std::lock_guard<std::mutex> lock(mu);
+    REQUIRE_EQ(events.size(), 6);
+    CHECK_EQ(events[0].status, 401);
+    CHECK_EQ(events[0].error_code, "UNAUTHORIZED");
+    CHECK_EQ(events[0].source, "bearer_auth");
+    CHECK_EQ(events[0].reason, "missing_token");
+
+    CHECK_EQ(events[1].status, 401);
+    CHECK_EQ(events[1].error_code, "INVALID_TOKEN");
+    CHECK_EQ(events[1].source, "bearer_auth");
+    CHECK_EQ(events[1].reason, "token_expired");
+
+    CHECK_EQ(events[2].status, 401);
+    CHECK_EQ(events[2].error_code, "INVALID_TOKEN");
+    CHECK_EQ(events[2].source, "bearer_auth");
+    CHECK_EQ(events[2].reason, "signature_mismatch");
+
+    CHECK_EQ(events[3].status, 401);
+    CHECK_EQ(events[3].error_code, "INVALID_TOKEN");
+    CHECK_EQ(events[3].source, "bearer_auth");
+    CHECK_EQ(events[3].reason, "token_rejected");
+
+    CHECK_EQ(events[4].status, 401);
+    CHECK_EQ(events[4].error_code, "UNAUTHORIZED");
+    CHECK_EQ(events[4].source, "bearer_auth");
+    CHECK_EQ(events[4].reason, "missing_token");
+
+    CHECK_EQ(events[5].status, 401);
+    CHECK_EQ(events[5].error_code, "UNAUTHORIZED");
+    CHECK_EQ(events[5].source, "bearer_auth");
+    CHECK_EQ(events[5].reason, "missing_token");
 }
 } // TEST_SUITE("jwt")

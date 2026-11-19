@@ -197,7 +197,8 @@ coke::Task<void> HttpServer::process(ServerContext server_ctx) {
 
     std::string_view req_path = ctx.path();
     if (req_path.find("/../") != std::string_view::npos || req_path.ends_with("/..")) {
-        reply_error(ctx, HttpError::forbidden("Forbidden: Path traversal rejected", "FORBIDDEN"));
+        reply_error(ctx, HttpError::forbidden("Forbidden: Path traversal rejected", "FORBIDDEN")
+            .with_diagnostic("http_server", "path_traversal"));
         apply_conn_governance(ctx);
         (void)co_await ctx.reply();
         co_return;
@@ -215,7 +216,8 @@ coke::Task<void> HttpServer::process(ServerContext server_ctx) {
     RouteResult result = router_.route(ctx.method(), req_path);
     for (const auto &[k, v] : result.params) {
         if (v == ".." || v.find("/../") != std::string_view::npos || v.starts_with("../") || v.ends_with("/..")) {
-            reply_error(ctx, HttpError::forbidden("Forbidden: Path traversal rejected in parameters", "FORBIDDEN"));
+            reply_error(ctx, HttpError::forbidden("Forbidden: Path traversal rejected in parameters", "FORBIDDEN")
+                .with_diagnostic("http_server", "path_traversal"));
             apply_conn_governance(ctx);
             (void)co_await ctx.reply();
             co_return;
@@ -228,21 +230,21 @@ coke::Task<void> HttpServer::process(ServerContext server_ctx) {
     try {
         if (result.matched && result.endpoint && result.endpoint->handler) {
             ctx.prepare_chunked_body_if_needed();
-            if (result.endpoint->max_body_size > 0 && ctx.req_body().size() > result.endpoint->max_body_size) {
-                reply_error(ctx, HttpError::payload_too_large("Payload Too Large", "PAYLOAD_TOO_LARGE"));
-                apply_conn_governance(ctx);
-                (void)co_await ctx.reply();
-                co_return;
-            }
-
             if (middlewares_.empty() && result.endpoint->middlewares.empty()) {
+                if (result.endpoint->max_body_size > 0 && ctx.req_body().size() > result.endpoint->max_body_size) {
+                    reply_payload_too_large(ctx, result.endpoint->max_body_size);
+                    apply_conn_governance(ctx);
+                    (void)co_await ctx.reply();
+                    co_return;
+                }
                 if (result.endpoint->handler.is_sync()) {
                     result.endpoint->handler.invoke_sync(ctx);
                 } else {
                     co_await result.endpoint->handler.invoke_async(ctx);
                 }
             } else {
-                co_await compose_and_run(middlewares_, result.endpoint->middlewares, ctx, result.endpoint->handler);
+                co_await compose_and_run(middlewares_, result.endpoint->middlewares, ctx,
+                    result.endpoint->handler, result.endpoint->max_body_size);
             }
         } else {
             const bool has_consumer = !middlewares_.empty() ||

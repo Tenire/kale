@@ -43,6 +43,18 @@ MemoryRateLimitStore::MemoryRateLimitStore(RateLimitPolicy policy)
     : impl_(std::make_unique<Impl>(policy)) {}
 MemoryRateLimitStore::~MemoryRateLimitStore() = default;
 
+namespace {
+constexpr std::string_view deny_reason_to_string(RateLimitDenyReason reason) noexcept {
+    switch (reason) {
+        case RateLimitDenyReason::None: return "none";
+        case RateLimitDenyReason::QuotaExceeded: return "quota_exceeded";
+        case RateLimitDenyReason::KeyTooLong: return "key_too_long";
+        case RateLimitDenyReason::CapacityExceeded: return "capacity_exceeded";
+    }
+    return "unknown";
+}
+} // namespace
+
 RateLimitVerdict MemoryRateLimitStore::consume(std::string_view key, RateLimitClock::time_point now) {
     auto &state = *impl_;
     const std::lock_guard lock(state.mutex);
@@ -50,10 +62,10 @@ RateLimitVerdict MemoryRateLimitStore::consume(std::string_view key, RateLimitCl
     state.latest = now;
     state.sampled = true;
 
-    const auto deny_window = [&] {
-        return RateLimitVerdict{false, 0, retry_seconds(state.policy.window)};
+    const auto deny_window = [&](RateLimitDenyReason reason) {
+        return RateLimitVerdict{false, 0, retry_seconds(state.policy.window), reason};
     };
-    if (key.size() > state.policy.max_key_bytes) return deny_window();
+    if (key.size() > state.policy.max_key_bytes) return deny_window(RateLimitDenyReason::KeyTooLong);
 
     // Bounded maintenance, with one expiry record per live window, never per hit.
     for (std::size_t reclaimed = 0; reclaimed < 64 && !state.expirations.empty(); ++reclaimed) {
@@ -74,7 +86,7 @@ RateLimitVerdict MemoryRateLimitStore::consume(std::string_view key, RateLimitCl
         auto &window = entry->second;
         if (window.used >= state.policy.limit) {
             const auto wait_time = window.expires > now ? window.expires - now : RateLimitClock::duration::zero();
-            return {false, 0, retry_seconds(wait_time)};
+            return {false, 0, retry_seconds(wait_time), RateLimitDenyReason::QuotaExceeded};
         }
         ++window.used;
         return {true, state.policy.limit - window.used, std::chrono::seconds::zero()};
@@ -82,11 +94,11 @@ RateLimitVerdict MemoryRateLimitStore::consume(std::string_view key, RateLimitCl
     if (state.entries.size() >= state.policy.max_keys) {
         const auto earliest = state.expirations.begin()->first;
         const auto wait_time = earliest > now ? earliest - now : RateLimitClock::duration::zero();
-        return {false, 0, retry_seconds(wait_time)};
+        return {false, 0, retry_seconds(wait_time), RateLimitDenyReason::CapacityExceeded};
     }
     // Avoid signed duration overflow when scheduling a new window near time_point::max().
     if (now.time_since_epoch() > RateLimitClock::duration::max() - state.policy.window) {
-        return deny_window();
+        return deny_window(RateLimitDenyReason::QuotaExceeded);
     }
     const auto expires = now + state.policy.window;
     const auto inserted = state.entries.emplace(
@@ -117,7 +129,13 @@ Middleware rate_limiter(RateLimitStore &store, RateLimiterConfig config) {
         if (!verdict.allowed) {
             const int retry_after_sec = static_cast<int>(
                 std::max(std::chrono::seconds(1), verdict.retry_after).count());
-            reply_error(ctx, HttpError::too_many_requests("Too Many Requests", retry_after_sec));
+            auto err = HttpError::too_many_requests("Too Many Requests", retry_after_sec);
+            err.with_diagnostic("rate_limiter", std::string(deny_reason_to_string(verdict.deny_reason)));
+            err.with_internal_detail("retry_after", std::to_string(retry_after_sec));
+            if (!config.route_tag.empty()) {
+                err.with_internal_detail("route_tag", config.route_tag);
+            }
+            reply_error(ctx, err);
             co_return;
         }
         co_await next();

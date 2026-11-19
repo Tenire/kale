@@ -20,10 +20,24 @@ struct ErrorContext {
     bool is_exposed{false};
     const HttpError::DetailMap *details{nullptr};
     const HttpError::HeaderList *headers{nullptr};
-    const std::exception *raw_exception{nullptr};
-    std::exception_ptr exception{};
     std::string_view request_id{};
 };
+
+// Borrowed for the synchronous ErrorObserver::operator() call only; async sinks must copy retained fields.
+struct ErrorEvent {
+    int status_code{500};
+    std::string_view error_code;
+    std::string_view source;
+    std::string_view reason;
+    std::string_view message; // unredacted
+    bool is_exposed{false};
+    const HttpError::DetailMap *details{nullptr};
+    const HttpError::DetailMap *internal_details{nullptr};
+    std::string_view request_id{};
+    std::exception_ptr exception{};
+};
+
+using ErrorObserver = std::function<void(const Context &ctx, const ErrorEvent &event)>;
 
 using ErrorFormatter = std::function<void(Context &ctx, const ErrorContext &err_ctx)>;
 
@@ -34,6 +48,7 @@ struct ErrorPolicy {
     std::string default_blurred_message{"Internal Server Error"};
     std::string default_error_code{"INTERNAL_SERVER_ERROR"};
     Logger logger{};
+    ErrorObserver on_error{};
 };
 
 // Pure-string core formatters (zero high-layer dependencies)

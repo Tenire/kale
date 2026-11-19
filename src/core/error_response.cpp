@@ -377,7 +377,6 @@ void reply_error_impl(Context &ctx,
     const std::exception *caught_std = nullptr;
 
     if (ep) {
-        err_ctx.exception = ep;
         try {
             std::rethrow_exception(ep);
         } catch (const HttpError &he) {
@@ -395,22 +394,44 @@ void reply_error_impl(Context &ctx,
         err_ctx.is_exposed = caught_http->is_exposed();
         err_ctx.details = &caught_http->details();
         err_ctx.headers = &caught_http->headers();
-        err_ctx.raw_exception = caught_http;
     } else if (caught_std) {
         err_ctx.status_code = policy.default_status_code;
         err_ctx.error_code = policy.default_error_code;
         err_ctx.message = caught_std->what();
         err_ctx.is_exposed = false;
-        err_ctx.raw_exception = caught_std;
     } else {
         err_ctx.status_code = policy.default_status_code;
         err_ctx.error_code = policy.default_error_code;
         err_ctx.message = "unknown non-std exception";
         err_ctx.is_exposed = false;
-        err_ctx.raw_exception = nullptr;
     }
 
     const std::string_view unredacted_message = err_ctx.message;
+    if (policy.on_error) {
+        ErrorEvent event;
+        event.status_code = err_ctx.status_code;
+        event.error_code = err_ctx.error_code;
+        if (caught_http) {
+            event.source = caught_http->source();
+            event.reason = caught_http->reason();
+            event.internal_details = caught_http->internal_details().empty() ? nullptr : &caught_http->internal_details();
+        } else if (caught_std) {
+            event.source = "http_server";
+            event.reason = "unhandled_exception";
+        } else {
+            event.source = "http_server";
+            event.reason = "unknown_exception";
+        }
+        event.message = unredacted_message;
+        event.is_exposed = err_ctx.is_exposed;
+        event.details = err_ctx.details;
+        event.request_id = err_ctx.request_id;
+        event.exception = ep;
+        try {
+            policy.on_error(ctx, event);
+        } catch (...) {
+        }
+    }
     if (!err_ctx.is_exposed && !policy.expose_internal_errors) {
         err_ctx.message = policy.default_blurred_message;
         err_ctx.error_code = policy.default_error_code;

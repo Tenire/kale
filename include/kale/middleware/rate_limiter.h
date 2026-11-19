@@ -21,10 +21,18 @@ struct RateLimitPolicy {
     std::size_t max_key_bytes{1024};
 };
 
+enum class RateLimitDenyReason : std::uint8_t {
+    None = 0,
+    QuotaExceeded,
+    KeyTooLong,
+    CapacityExceeded,
+};
+
 struct RateLimitVerdict {
     bool allowed{false};
     std::uint64_t remaining{0};
     std::chrono::seconds retry_after{0};
+    RateLimitDenyReason deny_reason{RateLimitDenyReason::None};
 };
 
 // Interface for rate limit storage. Implementations must be thread-safe.

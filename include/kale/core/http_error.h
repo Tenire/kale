@@ -43,6 +43,21 @@ public:
     const HeaderList &headers() const noexcept { return headers_; }
     const DetailMap &details() const noexcept { return details_; }
 
+    HttpError &with_diagnostic(std::string source, std::string reason) {
+        source_ = std::move(source);
+        reason_ = std::move(reason);
+        return *this;
+    }
+
+    HttpError &with_internal_detail(std::string key, std::string value) {
+        internal_details_.insert_or_assign(std::move(key), std::move(value));
+        return *this;
+    }
+
+    std::string_view source() const noexcept { return source_; }
+    std::string_view reason() const noexcept { return reason_; }
+    const DetailMap &internal_details() const noexcept { return internal_details_; }
+
     // RFC semantic factories
     static HttpError bad_request(std::string message = "Bad Request", std::string error_code = "BAD_REQUEST");
     static HttpError unauthorized(std::string message = "Unauthorized", std::string error_code = "UNAUTHORIZED", std::string_view realm = "");
@@ -62,6 +77,9 @@ private:
     bool is_exposed_{true};
     HeaderList headers_;
     DetailMap details_;
+    std::string source_;
+    std::string reason_;
+    DetailMap internal_details_;
 };
 
 class JsonInputError : public HttpError {
